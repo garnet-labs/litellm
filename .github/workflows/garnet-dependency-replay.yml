@@ -1,0 +1,44 @@
+name: Garnet Dependency Replay
+
+on:
+  push:
+    branches:
+      - 'rb/**'
+  pull_request:
+    paths:
+      - 'ui/litellm-dashboard/package.json'
+      - 'ui/litellm-dashboard/package-lock.json'
+      - '.github/workflows/garnet-dependency-replay.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-dependency-replay-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dashboard-install:
+    name: Dashboard dependency install (recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ui/litellm-dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.1'
+
+      - name: Cold dependency install
+        run: npm ci --ignore-scripts=false
+
+      - name: Hold capture window for delayed children
+        run: sleep 45
