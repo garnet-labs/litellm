@@ -1,0 +1,141 @@
+name: Garnet Evidence Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number whose finalized Garnet evidence should be judged
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  runtime-evidence-gate:
+    name: Runtime evidence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read Garnet evidence and decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: Number('${{ inputs.pr_number }}')
+            })
+            const head = pr.head.sha
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 }
+            )
+            const marker = `<!-- garnet:commit ${head} -->`
+            const evidence = comments
+              .filter(c => c.user?.login === 'garnet-runtime-review[bot]')
+              .find(c => c.body?.includes(marker))
+
+            let decision = 'HOLD'
+            let reason = ''
+            let summary = null
+            let diff = ''
+
+            if (!evidence) {
+              reason = `No trusted Garnet comment is bound to head \`${head}\`.`
+            } else {
+              const match = evidence.body.match(/<!-- garnet:summary (\{.*?\}) -->/s)
+              if (!match) {
+                reason = 'The head-bound Garnet comment has no machine-readable summary.'
+              } else {
+                summary = JSON.parse(match[1])
+                if (summary.commit !== head) {
+                  reason = `Summary commit \`${summary.commit}\` does not match PR head \`${head}\`.`
+                } else if (!summary.previous) {
+                  reason = 'The Garnet profile has no same-PR comparison commit.'
+                } else if ((summary.jobs || 0) < 1) {
+                  reason = 'The Garnet profile contains no recorded workload job.'
+                } else {
+                  const workloadDelta =
+                    (summary.changed || 0) +
+                    (summary.added || 0) +
+                    (summary.removed || 0) +
+                    (summary.vanished || 0)
+                  if (workloadDelta === 0) {
+                    decision = 'CLEAR'
+                    reason = 'The recorded workload is unchanged from the same-PR control.'
+                  } else {
+                    reason = 'The recorded workload changed. Strict policy requires human review for every workload destination delta.'
+                  }
+                  const diffMatch = evidence.body.match(/```diff\n([\s\S]*?)```/)
+                  if (diffMatch) diff = diffMatch[1].trim().split('\n').slice(0, 45).join('\n')
+                }
+              }
+            }
+
+            const rows = summary ? [
+              `| PR head | \`${head}\` |`,
+              `| Compared with | \`${summary.previous || 'missing'}\` |`,
+              `| Recorded jobs | ${summary.jobs ?? 'n.a.'} |`,
+              `| Changed jobs | ${summary.changed ?? 'n.a.'} |`,
+              `| Workload destinations | +${summary.added ?? 'n.a.'} / -${summary.removed ?? 'n.a.'} |`,
+              `| Process chains | ${summary.chains ?? 'n.a.'} |`,
+              `| Total destinations | ${summary.destinations ?? 'n.a.'} |`,
+              `| Runner background | +${summary.backgroundAdded ?? 'n.a.'} / -${summary.backgroundRemoved ?? 'n.a.'} (non-gating) |`
+            ].join('\n') : `| PR head | \`${head}\` |\n| Evidence | missing or invalid |`
+
+            const evidenceUrl = evidence?.html_url || 'No exact-head Garnet comment'
+            const body = [
+              `## Garnet runtime evidence gate: ${decision}`,
+              '',
+              reason,
+              '',
+              `This decision consumed the [exact-head Garnet Runtime Review](${evidenceUrl}) before evaluating the gate.`,
+              '',
+              '| Evidence | Value |',
+              '| --- | --- |',
+              rows,
+              diff ? `\n### Recorded workload diff\n\n\`\`\`diff\n${diff}\n\`\`\`` : '',
+              '',
+              '### Gate policy',
+              '',
+              '- Fail closed when exact-head evidence or a same-PR comparison is missing.',
+              '- CLEAR only when the recorded workload has no changed job and no added, removed, or vanished workload destination.',
+              '- Ignore runner-background rotation for the decision.',
+              '- HOLD every workload delta for a human; this gate does not infer that a new CDN, registry, or checksum endpoint is safe.',
+              '',
+              `Policy result is bound to commit \`${head}\`.`
+            ].filter(Boolean).join('\n')
+
+            await github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number: pr.number,
+              event: decision === 'CLEAR' ? 'APPROVE' : 'COMMENT',
+              body
+            })
+
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: head,
+              state: decision === 'CLEAR' ? 'success' : 'failure',
+              context: 'Garnet runtime evidence gate',
+              description: decision === 'CLEAR'
+                ? 'CLEAR: exact-head runtime unchanged'
+                : 'HOLD: runtime changed or evidence incomplete',
+              target_url: evidence?.html_url || `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`
+            })
+
+            await core.summary
+              .addHeading(`Garnet runtime evidence gate: ${decision}`)
+              .addRaw(body)
+              .write()
+
+            if (decision !== 'CLEAR') core.setFailed(reason)
