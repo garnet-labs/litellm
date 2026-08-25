@@ -50,7 +50,7 @@ diff should do — the conclusion, not a restatement of the record.
 6. Never repeat verdicts, scores, severities, baseline classifications, or
    safety judgments from Garnet. Derive review judgment from the diff.
 7. Prefix every runtime-grounded statement exactly with:
-   `Runtime evidence (Garnet, head <sha7>): `
+   `Runtime evidence (Garnet, head <sha7>):` followed by a space
    Include the observed execution chain, destination, workflow/job, and the
    Execution Profile URL when one is present.
 

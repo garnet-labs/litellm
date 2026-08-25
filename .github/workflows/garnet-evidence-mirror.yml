@@ -44,6 +44,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
+      RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,7 +60,7 @@ jobs:
             PR_NUMBER="${pr_number}" HEAD_SHA="${head_sha}" node .github/scripts/garnet-evidence-mirror.mjs
             exit 0
           fi
-          head_sha='${{ github.event.workflow_run.head_sha }}'
+          head_sha="${RUN_HEAD_SHA}"
           prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/pulls" --jq ".[] | select(.state == \"open\" and .head.sha == \"${head_sha}\") | .number")
           if [ -z "${prs}" ]; then
             echo "No open PR currently points at ${head_sha}; skipping stale run."

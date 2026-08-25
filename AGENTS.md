@@ -288,5 +288,5 @@ Runtime Review comment. When reviewing a pull request, follow
    execution chain the change does not explain, or state that recorded
    behavior is explained by the change.
 3. Prefix every runtime-grounded statement exactly with
-   `Runtime evidence (Garnet, head <sha7>): `. Never repeat Garnet verdicts,
+   `Runtime evidence (Garnet, head <sha7>):` followed by a space. Never repeat Garnet verdicts,
    scores, or severities; judgment stays with you.
