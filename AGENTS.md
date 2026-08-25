@@ -272,3 +272,21 @@ Ruff is the primary fast linter. For the full lint suite (including mypy, black,
 - SVGs used as provider logos (loaded via `<img>` tags) must NOT use `fill="currentColor"` — replace with an explicit color like `#000000` or use the `-color` variant from lobehub icons, since CSS color inheritance does not work inside `<img>` elements.
 - Provider logos live in `ui/litellm-dashboard/public/assets/logos/` (source) and `litellm/proxy/_experimental/out/assets/logos/` (pre-built). Both locations must have the file for it to work in dev and proxy-served modes.
 - UI Vitest tests: `cd ui/litellm-dashboard && npx vitest run`
+## Runtime evidence (Garnet)
+
+Pull requests in this repository can carry a kernel-recorded execution record
+from Garnet Runtime Review. The PR description holds a `Runtime evidence
+(Garnet)` section between `<!-- garnet:evidence:begin -->` and
+`<!-- garnet:evidence:end -->` — a verbatim mirror of the trusted Garnet
+Runtime Review comment. When reviewing a pull request, follow
+[`REVIEW.md`](REVIEW.md) before finalizing the review. In short:
+
+1. Use the mirrored record only when its `<!-- garnet:commit <sha> -->` equals
+   the PR head. A missing, stale, or pending record is no runtime evidence,
+   not a clean run.
+2. Cross-check the record against the diff: name any recorded destination or
+   execution chain the change does not explain, or state that recorded
+   behavior is explained by the change.
+3. Prefix every runtime-grounded statement exactly with
+   `Runtime evidence (Garnet, head <sha7>): `. Never repeat Garnet verdicts,
+   scores, or severities; judgment stays with you.

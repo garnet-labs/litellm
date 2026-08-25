@@ -163,3 +163,22 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 1. **Create a Prisma migration** (permanent) — run `prisma migrate dev --name <description>` in the worktree. The generated file will be picked up by `prisma migrate deploy` on next startup.
 2. **Apply manually for local dev** — `psql -d litellm -c "ALTER TABLE ... ADD COLUMN IF NOT EXISTS ..."` after each proxy start. Fine for dev, not for production.
 3. **Update litellm-proxy-extras** — if the package is installed from PyPI, its migration directory must include the new file. Either update the package or run the migration manually until the next release ships it.
+
+## Runtime evidence (Garnet)
+
+Pull requests in this repository can carry a kernel-recorded execution record
+from Garnet Runtime Review. The PR description holds a `Runtime evidence
+(Garnet)` section between `<!-- garnet:evidence:begin -->` and
+`<!-- garnet:evidence:end -->` — a verbatim mirror of the trusted Garnet
+Runtime Review comment. When reviewing a pull request, follow
+[`REVIEW.md`](REVIEW.md) before finalizing the review. In short:
+
+1. Use the mirrored record only when its `<!-- garnet:commit <sha> -->` equals
+   the PR head. A missing, stale, or pending record is no runtime evidence,
+   not a clean run.
+2. Cross-check the record against the diff: name any recorded destination or
+   execution chain the change does not explain, or state that recorded
+   behavior is explained by the change.
+3. Prefix every runtime-grounded statement exactly with
+   `Runtime evidence (Garnet, head <sha7>): `. Never repeat Garnet verdicts,
+   scores, or severities; judgment stays with you.
