@@ -85,7 +85,7 @@ jobs:
               `| Recorded jobs | ${summary.jobs ?? 'n.a.'} |`,
               `| Changed jobs | ${summary.changed ?? 'n.a.'} |`,
               `| Workload destinations | +${summary.added ?? 'n.a.'} / -${summary.removed ?? 'n.a.'} |`,
-              `| Process chains | ${summary.chains ?? 'n.a.'} |`,
+              `| Execution chains | ${summary.chains ?? 'n.a.'} |`,
               `| Total destinations | ${summary.destinations ?? 'n.a.'} |`,
               `| Runner background | +${summary.backgroundAdded ?? 'n.a.'} / -${summary.backgroundRemoved ?? 'n.a.'} (non-gating) |`
             ].join('\n') : `| PR head | \`${head}\` |\n| Evidence | missing or invalid |`
