@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
@@ -181,6 +182,22 @@ def read_generator_warnings(stderr: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(saturated))
 
 
+def _last_json_document(stdout: str) -> str:
+    """With --processes every forked worker prints its own empty `[]` summary before the master prints
+    the real one, so the master's document is the last one on stdout."""
+    documents: Final = tuple(_json_documents(json.JSONDecoder(), stdout))
+    return documents[-1] if documents else stdout
+
+
+def _json_documents(decoder: json.JSONDecoder, text: str) -> Iterator[str]:
+    position = 0  # rebind-ok: cursor over a stream of concatenated JSON documents
+    while text[position:].strip():
+        start: int = len(text) - len(text[position:].lstrip())
+        end: int = decoder.raw_decode(text, start)[1]
+        yield text[start:end]
+        position = end  # rebind-ok: advance past the document just read
+
+
 @step("Drive {users} locust users at {endpoints} for {duration_seconds}s")
 def run_gateway_load(
     *,
@@ -191,12 +208,15 @@ def run_gateway_load(
     users: int,
     spawn_rate: float,
     duration_seconds: float,
+    processes: int = 1,
 ) -> LoadResult:
     """Drive `endpoints` from headless locust and aggregate what it reported.
 
     Each simulated user picks one of `api_keys`, so auth and budget lookups spread over a
     pool of virtual keys instead of keeping one key's cache entry permanently warm, and one
     of `endpoints` round robin, so the run covers every route the caller asked for.
+    `processes` above 1 has locust fork that many workers behind one master on this host,
+    which is how a single generator gets past the throughput one Python process can push.
     """
     with tempfile.TemporaryDirectory(prefix="e2e-load-") as report_dir:
         csv_prefix = Path(report_dir) / _CSV_PREFIX
@@ -221,6 +241,7 @@ def run_gateway_load(
                 f"{int(duration_seconds)}s",
                 "--exit-code-on-error",
                 "0",
+                *(("--processes", str(processes)) if processes > 1 else ()),
             ],
             env={
                 **os.environ,
@@ -240,7 +261,7 @@ def run_gateway_load(
                 f"--exit-code-on-error 0):\n{completed.stderr}"
             )
         try:
-            entries = _STATS_ADAPTER.validate_json(completed.stdout)
+            entries = _STATS_ADAPTER.validate_json(_last_json_document(completed.stdout))
         except ValueError as exc:
             raise RuntimeError(
                 f"locust exited 0 but did not print a parseable --json throughput summary on stdout; "
