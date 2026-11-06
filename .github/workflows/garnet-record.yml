@@ -1,6 +1,7 @@
 name: Dependency install and test (recorded)
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
