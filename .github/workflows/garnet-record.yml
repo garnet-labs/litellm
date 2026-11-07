@@ -46,10 +46,11 @@ jobs:
         continue-on-error: true
         env:
           OPENAI_API_KEY: sk-replay-placeholder
+          LITELLM_MASTER_KEY: sk-replay-master-placeholder
         run: |
           uv run --no-sync litellm --model openai/gpt-4o-mini --port 4000 --num_workers 2 > proxy.log 2>&1 &
           for i in $(seq 1 90); do curl -sf localhost:4000/health/liveliness && break; sleep 2; done
-          curl -s localhost:4000/v1/chat/completions -H 'content-type: application/json' -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' || true
+          curl -s localhost:4000/v1/chat/completions -H 'content-type: application/json' -H 'authorization: Bearer sk-replay-master-placeholder' -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' || true
           sleep 10
           kill %1 || true
           tail -40 proxy.log
