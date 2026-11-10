@@ -1,0 +1,22 @@
+name: Complete superseded evidence checks
+on:
+  workflow_dispatch:
+permissions:
+  checks: write
+jobs:
+  complete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Complete superseded pending runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for id in 130001917165 130002325491; do
+            gh api -X PATCH "repos/${REPO}/check-runs/${id}" \
+              -f status=completed -f conclusion=neutral \
+              -f 'output[title]=Superseded: pending run from the pre-fix gate' \
+              -f 'output[summary]=This pending run was published by the gate before the fix that stopped publishing pending check runs.' \
+              --jq '[.id,.status,.conclusion]|@tsv'
+          done
