@@ -41,6 +41,9 @@ jobs:
       - name: Install dependencies
         run: "uv sync --frozen --group ci --extra proxy || uv sync --frozen --extra proxy"
 
+      - name: Install build requirements
+        run: "uv pip install -r ci/requirements-build.txt"
+
       - name: Test
         continue-on-error: true
         run: "uv run --no-sync python -c \"import pypdf; print(pypdf.__version__)\""
