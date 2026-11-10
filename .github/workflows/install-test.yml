@@ -51,7 +51,7 @@ jobs:
 
       - name: Test
         continue-on-error: true
-        run: "uv run --no-sync python -c \"import pypdf; print(pypdf.__version__)\""
+        run: 'uv run --no-sync python3.12 -c "import pypdf; print(pypdf.__version__); import time; time.sleep(20)"'
 
       - name: Let processes settle
         if: always()
