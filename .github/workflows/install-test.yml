@@ -47,7 +47,7 @@ jobs:
         run: gh release download lt-buildinfo-wheels --pattern 'lt_buildinfo-*.whl' --dir ci/wheelhouse --repo "$GITHUB_REPOSITORY"
 
       - name: Install build requirements
-        run: "uv pip install -r ci/requirements-build.txt"
+        run: "uv pip install --no-index --find-links "$GITHUB_WORKSPACE/ci/wheelhouse" -r ci/requirements-build.txt"
 
       - name: Test
         continue-on-error: true
