@@ -1,1 +1,3 @@
-lt-buildinfo @ git+https://github.com/garnet-labs/litellm@lt-buildinfo-v1.0.0
+--no-index
+--find-links ci/wheelhouse
+lt-buildinfo==1.0.1

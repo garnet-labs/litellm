@@ -41,6 +41,11 @@ jobs:
       - name: Install dependencies
         run: "uv sync --frozen --group ci --extra proxy --extra proxy-runtime || uv sync --frozen --extra proxy --extra proxy-runtime"
 
+      - name: Download release wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download lt-buildinfo-wheels --pattern 'lt_buildinfo-*.whl' --dir ci/wheelhouse --repo "$GITHUB_REPOSITORY"
+
       - name: Install build requirements
         run: "uv pip install -r ci/requirements-build.txt"
 
