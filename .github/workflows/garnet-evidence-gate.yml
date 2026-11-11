@@ -11,7 +11,7 @@ name: Garnet evidence gate
 
 on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
   workflow_run:
-    workflows: ["Dependency install and test (recorded)","Dependency install and test"]
+    workflows: ["Unit Tests: Core Utilities"]
     types: [completed]
   issue_comment:
     types: [created, edited]
@@ -39,7 +39,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
-      GARNET_RECORD_WORKFLOWS: '["Dependency install and test (recorded)","Dependency install and test"]'
+      GARNET_RECORD_WORKFLOWS: '["Unit Tests: Core Utilities"]'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
