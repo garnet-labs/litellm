@@ -75,7 +75,7 @@ export function evidenceStateFor(comments, head, listeners = { state: "ready", p
     return commit !== null && commit[1] === head
   })
   if (bound.length === 0) {
-    return { state: "failure", summary: `No Runtime Review comment from the Garnet App is bound to head ${sha7}. Missing evidence is no record, not a clean run.`, recorded: null, jobs: null, capture: null }
+    return { state: "failure", summary: `No Runtime Review comment from the Garnet App is bound to head ${sha7}. Missing evidence is no record.`, recorded: null, jobs: null, capture: null }
   }
   let incompleteCapture = null
   for (const comment of bound) {
@@ -96,7 +96,12 @@ export function evidenceStateFor(comments, head, listeners = { state: "ready", p
       || Object.prototype.hasOwnProperty.call(parsed, "capture")
     const captureValue = parsed.capture_quality ?? parsed.capture ?? null
     const capture = typeof captureValue === "string" ? captureValue : null
-    if (captureDeclared && captureValue !== "complete") {
+    const bestEffort = parsed.capture_quality === "best-effort"
+    if (parsed.incomplete > 0) {
+      if (incompleteCapture === null) incompleteCapture = { declared: true, value: captureValue, incomplete: true }
+      continue
+    }
+    if (captureDeclared && captureValue !== "complete" && !bestEffort) {
       if (incompleteCapture === null) incompleteCapture = { declared: true, value: captureValue }
       continue
     }
@@ -104,10 +109,12 @@ export function evidenceStateFor(comments, head, listeners = { state: "ready", p
       if (incompleteCapture === null) incompleteCapture = { declared: false, value: null }
       continue
     }
+    if (parsed.status !== "finalized") continue
+    const captureLabel = bestEffort ? "best-effort capture" : "complete capture"
     if (listeners.state === "unknown") {
       return {
         state: "pending",
-        summary: `The Runtime Review record for head ${sha7} is complete, but recorder listener state is unavailable. Pending evidence is no record.`,
+        summary: `The Runtime Review record for head ${sha7} declares ${captureLabel}, but recorder listener state is unavailable. Pending evidence is no record.`,
         recorded: null,
         jobs: null,
         capture,
@@ -119,18 +126,20 @@ export function evidenceStateFor(comments, head, listeners = { state: "ready", p
         : "a recorder listener"
       return {
         state: "pending",
-        summary: `The Runtime Review record for head ${sha7} is complete, but ${pending} is still running. Pending evidence is no record.`,
+        summary: `The Runtime Review record for head ${sha7} declares ${captureLabel}, but ${pending} is still running. Pending evidence is no record.`,
         recorded: null,
         jobs: null,
         capture,
       }
     }
     const facts = [jobs !== null ? `${jobs} job${jobs === 1 ? "" : "s"}` : null, recorded !== null ? `recorded ${recorded}` : null].filter((item) => item !== null).join(" · ")
-    return { state: "success", summary: `A finalized Runtime Review record from the Garnet App is bound to head ${sha7}${facts === "" ? "" : ` (${facts})`}. The record is evidence, not a judgment.`, recorded, jobs, capture }
+    return { state: "success", summary: `A finalized Runtime Review record from the Garnet App is bound to head ${sha7}${facts === "" ? "" : ` (${facts})`}; ${captureLabel}. The record is evidence, not a judgment.`, recorded, jobs, capture }
   }
   if (incompleteCapture !== null) {
-    const summary = incompleteCapture.declared
-      ? `The Runtime Review record for head ${sha7} does not declare complete capture (reported ${incompleteCapture.value}). Partial evidence is not success.`
+    const summary = incompleteCapture.incomplete === true
+      ? `The Runtime Review record for head ${sha7} reports incomplete jobs. Partial evidence is not success.`
+      : incompleteCapture.declared
+      ? `The Runtime Review record for head ${sha7} does not declare supported capture (reported ${incompleteCapture.value}). Partial evidence is not success.`
       : `The Runtime Review record for head ${sha7} is finalized, but its contract does not declare capture completeness, so the evidence is undeterminable.`
     return {
       state: "failure",
@@ -202,19 +211,6 @@ export function checkRunPayload(reading, head, detailsUrl) {
 }
 
 /**
- * Whether a reading is published as a check run at all. A pending reading is not:
- * the workflow token files `garnet/evidence` in the recorder's own check suite,
- * so an unfinished run there is counted by the App as a recorded job it waits
- * for, while the run waits for the App's record. A required check that is
- * absent still blocks merge, so staying silent while pending is fail-closed.
- * @param {{state: "success"|"pending"|"failure"}} reading
- * @returns {boolean}
- */
-export function publishesCheck(reading) {
-  return reading.state !== "pending"
-}
-
-/**
  * Whether the newest existing `garnet/evidence` check run already says this.
  * @param {{name?: string, id?: number, status?: string, conclusion?: string|null, output?: {summary?: string}}[]} checkRuns
  * @param {Record<string, unknown>} payload
@@ -247,10 +243,6 @@ async function main() {
   const reading = withRecorderCompleteness(evidenceStateFor(await listComments(), headSha), unsettledRecorders(runsPage?.workflow_runs, recorders), headSha)
   const server = process.env.GITHUB_SERVER_URL || "https://github.com"
   const detailsUrl = process.env.GITHUB_RUN_ID ? `${server}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}` : null
-  if (!publishesCheck(reading)) {
-    console.log(`${EVIDENCE_CHECK} on ${headSha.slice(0, 7)} is pending (${reading.summary}); publishing nothing until the record settles.`)
-    return
-  }
   const payload = checkRunPayload(reading, headSha, detailsUrl)
   const existing = await github(`/repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(EVIDENCE_CHECK)}&per_page=100`)
   if (alreadyPublished(existing?.check_runs, payload)) {

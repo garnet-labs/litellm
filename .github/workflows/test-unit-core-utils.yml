@@ -2,7 +2,7 @@ name: "Unit Tests: Core Utilities"
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'rb/**']
 
 permissions:
   contents: read
