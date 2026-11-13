@@ -94,5 +94,10 @@ jobs:
         run: |
           set -euo pipefail
           for pr_number in ${PRS}; do
+            # CI-check trigger proof: the Review rule alone requests these.
+            if [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq .base.ref)" = "rb/43899c-base-with" ]; then
+              echo "Skipping review request for #${pr_number}: rule-triggered proof base."
+              continue
+            fi
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-rereview.mjs
           done
