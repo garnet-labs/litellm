@@ -1,7 +1,8 @@
 # Success-only "record ready" signal for reviewers that start after a CI check.
-# Waits until the Garnet Runtime Review comment is finalized for this pull
-# request's head commit, then exits 0. It never fails: on timeout it logs a
-# neutral line and exits 0. It runs no pull request code and has no sensor.
+# Waits until the pull request description carries the Garnet evidence block
+# for this head commit in its finalized state (reviewers read the description),
+# then exits 0. It never fails: on timeout it logs a neutral line and exits 0.
+# It runs no pull request code and has no sensor.
 name: Garnet record ready
 
 on:
@@ -21,26 +22,25 @@ jobs:
     timeout-minutes: 50
     permissions:
       pull-requests: read
-      issues: read
     env:
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      - name: Wait for the finalized head-bound record
+      - name: Wait for the finalized head-bound evidence block in the description
         shell: bash
         run: |
           set -uo pipefail
           deadline=$(( $(date +%s) + 45 * 60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            found=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-              --jq '.[] | select(.user.login == "garnet-runtime-review[bot]" or .user.login == "garnet-ai[bot]") | .body' 2>/dev/null \
-              | grep -F "garnet:commit ${HEAD_SHA}" -A200 | grep -c '"status":"finalized"' || true)
-            if [ "${found:-0}" -gt 0 ]; then
-              echo "Garnet record finalized for ${HEAD_SHA}."
+            body=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .body 2>/dev/null || true)
+            block=$(printf '%s\n' "$body" | sed -n '/<!-- garnet:evidence:begin -->/,/<!-- garnet:evidence:end -->/p')
+            if printf '%s\n' "$block" | grep -qF "garnet:commit ${HEAD_SHA}" \
+              && printf '%s\n' "$block" | grep -qF '"status":"finalized"'; then
+              echo "Finalized Garnet evidence for ${HEAD_SHA} is in the description."
               exit 0
             fi
-            sleep 20
+            sleep 15
           done
-          echo "No finalized Garnet record for ${HEAD_SHA} within 45 minutes; not blocking."
+          echo "No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes; not blocking."
           exit 0
