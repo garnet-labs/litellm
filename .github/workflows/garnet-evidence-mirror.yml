@@ -95,7 +95,7 @@ jobs:
           set -euo pipefail
           for pr_number in ${PRS}; do
             # CI-check trigger proof: the Review rule alone requests these.
-            if [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq .base.ref)" = "rb/43899c-base-with" ]; then
+            if case "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq .base.ref)" in rb/43899c-base-with|rb/43899d-base-with) true ;; *) false ;; esac; then
               echo "Skipping review request for #${pr_number}: rule-triggered proof base."
               continue
             fi
