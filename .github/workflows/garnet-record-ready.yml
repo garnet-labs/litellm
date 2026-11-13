@@ -1,0 +1,46 @@
+# Success-only "record ready" signal for reviewers that start after a CI check.
+# Waits until the Garnet Runtime Review comment is finalized for this pull
+# request's head commit, then exits 0. It never fails: on timeout it logs a
+# neutral line and exits 0. It runs no pull request code and has no sensor.
+name: Garnet record ready
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: garnet-record-ready-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  record-ready:
+    name: Garnet record ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      pull-requests: read
+      issues: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Wait for the finalized head-bound record
+        shell: bash
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            found=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.user.login == "garnet-runtime-review[bot]" or .user.login == "garnet-ai[bot]") | .body' 2>/dev/null \
+              | grep -F "garnet:commit ${HEAD_SHA}" -A200 | grep -c '"status":"finalized"' || true)
+            if [ "${found:-0}" -gt 0 ]; then
+              echo "Garnet record finalized for ${HEAD_SHA}."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "No finalized Garnet record for ${HEAD_SHA} within 45 minutes; not blocking."
+          exit 0
