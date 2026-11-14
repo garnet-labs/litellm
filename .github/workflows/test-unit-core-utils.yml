@@ -1,6 +1,9 @@
 name: "Unit Tests: Core Utilities"
 
 on:
+  push:
+    branches: ['rb/**']
+  workflow_dispatch:
   pull_request:
     branches: [main, 'rb/**']
 
