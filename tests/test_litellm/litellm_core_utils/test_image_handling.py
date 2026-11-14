@@ -217,3 +217,39 @@ def test_image_size_limit_disabled(monkeypatch):
     
     assert "Image URL download is disabled" in str(excinfo.value)
     assert "MAX_IMAGE_URL_DOWNLOAD_SIZE_MB=0" in str(excinfo.value)
+
+
+class ImageContentTypeClient:
+    def __init__(self, content_type, content):
+        self.content_type = content_type
+        self.content = content
+
+    def get(self, url, follow_redirects=True):
+        return Response(
+            status_code=200,
+            headers={"Content-Type": self.content_type},
+            content=self.content,
+            request=Request("GET", url),
+        )
+
+
+def test_image_url_png_content_type(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "module_level_client",
+        ImageContentTypeClient("image/png", b"\x89PNG\r\n\x1a\n..."),
+    )
+    result = convert_url_to_base64("https://example.com/content-type-png")
+
+    assert result.startswith("data:image/png;base64,")
+
+
+def test_image_url_jpeg_content_type(monkeypatch):
+    monkeypatch.setattr(
+        litellm,
+        "module_level_client",
+        ImageContentTypeClient("image/jpeg", b"\xff\xd8\xff..."),
+    )
+    result = convert_url_to_base64("https://example.com/content-type-jpeg")
+
+    assert result.startswith("data:image/jpeg;base64,")
