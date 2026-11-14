@@ -17,11 +17,12 @@ on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request co
 
 permissions: {}
 
-# One run at a time: several recorders and several comment edits fire for one
-# head, and the per-head lock is a comment, not an atomic write. Nothing is
-# cancelled once it started.
+# One run at a time per pull request: several recorders and several comment
+# edits fire for one head, and the per-head lock is a comment, not an atomic
+# write. Nothing is cancelled once it started; a shared group would drop the
+# queued runs of other pull requests while one waits for its record.
 concurrency:
-  group: garnet-evidence-mirror
+  group: garnet-evidence-mirror-${{ github.event.issue.number || github.event.workflow_run.pull_requests[0].number || 'shared' }}
   cancel-in-progress: false
 
 jobs:
