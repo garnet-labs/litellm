@@ -29,7 +29,8 @@ const TRUSTED_AUTHORS = new Set([
   "garnet-runtime-review-dev[bot]",
   "garnet-ai[bot]",
 ])
-export const EVIDENCE_CHECK = "garnet/evidence"
+const EVIDENCE_CHECK_ENV = process.env.GARNET_EVIDENCE_CHECK
+export const EVIDENCE_CHECK = typeof EVIDENCE_CHECK_ENV === "string" && EVIDENCE_CHECK_ENV !== "" ? EVIDENCE_CHECK_ENV : "garnet/evidence"
 /** Label `garnet-review-hold.yml` sets on a pull request it returned to draft. */
 export const HOLD_LABEL = "garnet-review-hold"
 /** The App edits its comment again seconds after finalizing; wait this long after the last edit. */
