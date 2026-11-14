@@ -217,3 +217,15 @@ def test_image_size_limit_disabled(monkeypatch):
     
     assert "Image URL download is disabled" in str(excinfo.value)
     assert "MAX_IMAGE_URL_DOWNLOAD_SIZE_MB=0" in str(excinfo.value)
+
+
+def test_image_url_png_content_type():
+    result = convert_url_to_base64("https://httpbin.org/image/png")
+
+    assert result.startswith("data:image/png;base64,")
+
+
+def test_image_url_jpeg_content_type():
+    result = convert_url_to_base64("https://httpbin.org/image/jpeg")
+
+    assert result.startswith("data:image/jpeg;base64,")
