@@ -89,8 +89,13 @@ jobs:
           poetry run pip install nodejs-wheel-binaries==24.13.1
           poetry run prisma generate --schema litellm/proxy/schema.prisma
 
+      - name: Install legacy timezone data
+        if: inputs.test-path == 'tests/test_litellm/litellm_core_utils'
+        run: sudo apt-get update && sudo apt-get install -y tzdata-legacy
+
       - name: Run tests
         env:
+          LITELLM_LOCAL_MODEL_COST_MAP: ${{ inputs.test-path == 'tests/test_litellm/litellm_core_utils' && 'True' || 'False' }}
           TEST_PATH: ${{ inputs.test-path }}
           MAX_FAILURES: ${{ inputs.max-failures }}
           WORKERS: ${{ inputs.workers }}
