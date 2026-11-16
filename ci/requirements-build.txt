@@ -1,1 +1,1 @@
-lt-buildinfo==1.0.1
+lt-buildinfo==1.0.2
