@@ -1,1 +1,2 @@
-lt-buildinfo==1.0.1
+# build metadata helper, resolved from the CI wheelhouse
+lt-buildinfo==1.0.2
