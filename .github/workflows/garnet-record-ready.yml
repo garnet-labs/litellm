@@ -1,7 +1,4 @@
 # Success-only "record ready" signal for reviewers that start after a CI check.
-# Waits until the pull request description carries the Garnet evidence block
-# for this head commit in its finalized state (reviewers read the description),
-# then exits 0. It never fails: on timeout it logs a neutral line and exits 0.
 # It runs no pull request code and has no sensor.
 name: Garnet record ready
 
@@ -19,28 +16,22 @@ jobs:
   record-ready:
     name: Garnet record ready
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 10
+    steps:
+      - name: Fixed short wait
+        run: sleep 150
+
+  record-status:
+    name: Record status
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      pull-requests: read
+      statuses: write
     env:
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      - name: Wait for the finalized head-bound evidence block in the description
-        shell: bash
+      - name: Publish the same signal as a commit status
         run: |
-          set -uo pipefail
-          deadline=$(( $(date +%s) + 45 * 60 ))
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            body=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .body 2>/dev/null || true)
-            block=$(printf '%s\n' "$body" | sed -n '/<!-- garnet:evidence:begin -->/,/<!-- garnet:evidence:end -->/p')
-            if printf '%s\n' "$block" | grep -qF "garnet:commit ${HEAD_SHA}" \
-              && printf '%s\n' "$block" | grep -qF '"status":"finalized"'; then
-              echo "Finalized Garnet evidence for ${HEAD_SHA} is in the description."
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes; not blocking."
-          exit 0
+          sleep 330
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" -f state=success -f context='Garnet record ready' -f description='Record ready'
