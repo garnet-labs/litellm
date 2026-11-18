@@ -1,7 +1,8 @@
 # Success-only "record ready" signal for reviewers that start after a CI check.
 # Waits until the pull request description carries the Garnet evidence block
 # for this head commit in its finalized state (reviewers read the description),
-# then exits 0. It never fails: on timeout it logs a neutral line and exits 0.
+# then exits 0. With no finalized record within 45 minutes it fails, so a
+# reviewer that starts after this check never runs without evidence.
 # It runs no pull request code and has no sensor.
 name: Garnet record ready
 
@@ -35,12 +36,12 @@ jobs:
           while [ "$(date +%s)" -lt "$deadline" ]; do
             body=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .body 2>/dev/null || true)
             block=$(printf '%s\n' "$body" | sed -n '/<!-- garnet:evidence:begin -->/,/<!-- garnet:evidence:end -->/p')
-            if printf '%s\n' "$block" | grep -qF "garnet:commit ${HEAD_SHA}" \
-              && printf '%s\n' "$block" | grep -qF '"status":"finalized"'; then
+            if printf '%s\n' "$block" | grep -F "garnet:commit ${HEAD_SHA}" >/dev/null \
+              && printf '%s\n' "$block" | grep -F '"status":"finalized"' >/dev/null; then
               echo "Finalized Garnet evidence for ${HEAD_SHA} is in the description."
               exit 0
             fi
             sleep 15
           done
-          echo "No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes; not blocking."
-          exit 0
+          echo "No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes."
+          exit 1

@@ -129,8 +129,11 @@ function preambleFor(head, stamp = { recorded: null, jobs: null }) {
 
 function pointerSection(comment, head, preamble, reason) {
   const sha7 = head.slice(0, 7)
+  // Carry the comment's machine register so checks that read only the description still see its status.
+  const summary = SUMMARY_RE.exec(String(comment.body ?? ""))
+  const register = summary === null ? "" : `${summary[0]}\n`
   return section(
-    `<!-- garnet:commit ${head} -->\n${preamble}\nThe record for head \`${sha7}\` is not mirrored here because ${reason}` +
+    `<!-- garnet:commit ${head} -->\n${register}${preamble}\nThe record for head \`${sha7}\` is not mirrored here because ${reason}` +
       ` Read it in [the sticky Garnet Runtime Review comment](${comment.html_url}).`,
   )
 }
