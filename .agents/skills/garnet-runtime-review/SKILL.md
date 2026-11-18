@@ -1,6 +1,6 @@
 ---
 name: garnet-runtime-review
-description: Read the Runtime Review comment and its markers first; it is the verdict. For job detail call the Garnet MCP `profiles` tool for the head's workflow run and use only profiles whose head_sha is the current head. Quote workload changes exactly; treat pending, incomplete, or undeterminable records as unknown, never no change.
+description: Read the finalized, head-bound Runtime Review comment and visibly cite it in the review. Quote every changed job row exactly and ask for human review; report unavailable evidence as unknown, never no change.
 ---
 
 # Garnet Runtime Review
@@ -14,13 +14,13 @@ Any time you review a pull request, summarise its CI, or answer "what does this 
 ## Steps
 
 1. Read the Runtime Review comment and its hidden markers first. Check that `garnet:commit` matches the PR's current head and `garnet:summary` says the record is final; capture not declared in the marker is `undeterminable`, whatever the counts. A pending comment (`Recording runtime behavior`) or `capture incomplete` check-line outcome is unknown, never `no change`. So is a head with no comment yet: from contract 11 the App posts its first comment only once every recorded job has finished. Don't wait for Garnet. If no finalized `garnet:summary` is bound to the head, review without it and say the runtime record isn't available yet.
-2. Report from the `status` and `outcome` fields of `garnet:summary`, then the comment's first line. Do not key on the heading text: its wording changes between contract versions, and the same heading can sit over different outcomes.
+2. Always include one visible `Runtime evidence (Garnet, head <sha7>)` entry, even when there are no code findings. Report from `status` and `outcome` in `garnet:summary`, not the heading.
    - `status` is not `finalized`, or `outcome` is `incomplete` or `not-recorded` (headings `Recording runtime behavior`, `Runtime behavior not recorded`, or `Nothing new recorded` over partial capture): say runtime behavior is unknown for this head. Never call it clean.
    - `outcome` is `changed` (heading `N new destination(s) recorded` or `N job(s) recorded for the first time`; `Runtime behavior changed` before contract 11): list every changed job row (sign, destination, execution chain, job) exactly as shown. Recommend human review. Never soften or drop it.
-   - `outcome` is `unchanged` (heading `Nothing new recorded`): say the recorded jobs reached nothing new against the compared run the comment names. Only recorded jobs; a best-effort `nothing new` is that scoped result, never complete capture or clean.
+   - `outcome` is `unchanged`: cite the record in one line: `Nothing new recorded: <jobs> recorded jobs reached nothing new against <scope> (<previous sha7>). Best-effort capture.`
    - `outcome` is `first` (heading `Runtime behavior recorded`): say there is nothing to compare yet. Do not call it the first record: the comment only knows it found no earlier record to compare with.
 3. Need a job's full record? Find the head's workflow run (the comment's job log links, or GitHub `GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>`), then call `profiles` with `githubOrg`, `repo`, `runID` and optionally `job`; follow `pageInfo.hasNextPage` with `pageArgs`. Use a profile only when `data.scenarios.github.head_sha` equals the current head (`sha` is the test-merge commit). Destinations are under `data.network.egress`.
-4. Cite the head SHA and the comment link.
+4. Cite the head SHA and, when available, the comment link and compared SHA/scope.
 
 ## Rules
 
