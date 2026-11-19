@@ -7,27 +7,37 @@ process.env.PR_NUMBER = "1"
 process.env.HEAD_SHA = "a".repeat(40)
 const { main } = await import("./garnet-evidence-mirror.mjs")
 
-test("opted-in PR skips comment reads and description writes", async () => {
+test("body marker opts PR out of comment reads and full-description writes", async () => {
   const calls = []
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init })
-    return { ok: true, json: async () => ({ head: { sha: process.env.HEAD_SHA }, labels: [{ name: "garnet-record-summary" }] }) }
+    return { ok: true, json: async () => ({ head: { sha: process.env.HEAD_SHA }, body: "Human description\n<!-- garnet:record-summary:opt-in -->" }) }
   }
   await main()
   assert.equal(calls.length, 1)
   assert.equal(calls[0].init.method, undefined)
 })
 
-test("unlabeled current-head PR retains missing-evidence mirroring", async () => {
+test("old label without body marker retains missing-evidence mirroring", async () => {
   const calls = []
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init })
-    return { ok: true, json: async () => url.includes("/comments?") ? [] : { head: { sha: process.env.HEAD_SHA }, labels: [], body: "Human description" } }
+    return { ok: true, json: async () => url.includes("/comments?") ? [] : { head: { sha: process.env.HEAD_SHA }, labels: [{ name: "garnet-record-summary" }], body: "Human description" } }
   }
   await main()
   const write = calls.find(({ init }) => init.method === "PATCH")
   assert.ok(write)
   assert.match(JSON.parse(write.init.body).body, /Human description[\s\S]*No runtime evidence/)
+})
+
+test("null PR body retains missing-evidence mirroring", async () => {
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init })
+    return { ok: true, json: async () => url.includes("/comments?") ? [] : { head: { sha: process.env.HEAD_SHA }, body: null } }
+  }
+  await main()
+  assert.match(JSON.parse(calls.find(({ init }) => init.method === "PATCH").init.body).body, /No runtime evidence/)
 })
 
 test("stale heads do not read comments or write", async () => {

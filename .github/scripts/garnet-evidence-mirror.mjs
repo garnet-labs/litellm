@@ -209,7 +209,7 @@ export async function main() {
     throw new Error("GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required")
   }
   const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
-  if (pr.labels?.some((label) => label.name === "garnet-record-summary")) {
+  if (pr.body?.includes("<!-- garnet:record-summary:opt-in -->")) {
     console.log("PR opted into garnet-record-summary; not mirroring the full comment.")
     return
   }
