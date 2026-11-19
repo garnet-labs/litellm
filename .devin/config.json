@@ -1,0 +1,10 @@
+{
+  "requiredPlugins": [
+    {
+      "source": "git-subdir",
+      "url": "https://github.com/garnet-labs/garnet-runtime-review-mcp.git",
+      "path": "plugins/devin/garnet-session-receipt",
+      "sha": "d9e5efb50dcf496e18a40993ba22654dd1e0402e"
+    }
+  ]
+}
