@@ -69,7 +69,7 @@ jinja2==3.1.6 # for prompt templates
 aiohttp==3.13.5 # for network calls
 tenacity==8.5.0  # for retrying requests, when litellm.num_retries set
 pydantic==2.12.5 # proxy + openai req. + mcp
-jsonschema==4.23.0 # validating json schema - aligned with openapi-core + mcp
+jsonschema==4.24.0 # validating json schema - aligned with openapi-core + mcp
 websockets==15.0.1 # for realtime API
 soundfile==0.12.1 # for audio file processing
 openapi-core==0.21.0 # for OpenAPI compliance tests
