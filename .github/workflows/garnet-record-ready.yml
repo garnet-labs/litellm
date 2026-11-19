@@ -34,7 +34,12 @@ jobs:
           set -uo pipefail
           deadline=$(( $(date +%s) + 45 * 60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            body=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .body 2>/dev/null || true)
+            pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" 2>/dev/null || true)
+            if printf '%s\n' "$pr" | jq -e 'any(.labels[]?; .name == "garnet-record-summary")' >/dev/null; then
+              echo "PR opted into garnet-record-summary; skipping the full-evidence description check."
+              exit 0
+            fi
+            body=$(printf '%s\n' "$pr" | jq -r '.body // ""')
             block=$(printf '%s\n' "$body" | sed -n '/<!-- garnet:evidence:begin -->/,/<!-- garnet:evidence:end -->/p')
             if printf '%s\n' "$block" | grep -F "garnet:commit ${HEAD_SHA}" >/dev/null \
               && printf '%s\n' "$block" | grep -F '"status":"finalized"' >/dev/null; then

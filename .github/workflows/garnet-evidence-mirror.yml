@@ -70,11 +70,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${EVENT_PR_NUMBER}" ]; then
-            head=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${EVENT_PR_NUMBER}" --jq 'select(.state == "open") | .head.sha')
+            head=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${EVENT_PR_NUMBER}" --jq 'select(.state == "open" and all(.labels[]; .name != "garnet-record-summary")) | .head.sha')
             prs="${EVENT_PR_NUMBER}"
           else
             head="${EVENT_HEAD_SHA}"
-            prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/pulls" --jq ".[] | select(.state == \"open\" and .head.sha == \"${head}\") | .number" | tr '\n' ' ')
+            prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/pulls" --jq ".[] | select(.state == \"open\" and .head.sha == \"${head}\" and all(.labels[]; .name != \"garnet-record-summary\")) | .number" | tr '\n' ' ')
           fi
           echo "sha=${head}" >> "${GITHUB_OUTPUT}"
           echo "prs=${prs}" >> "${GITHUB_OUTPUT}"
