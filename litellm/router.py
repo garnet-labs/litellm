@@ -10059,7 +10059,7 @@ class Router:
         self, healthy_deployments: List[Dict]
     ) -> List[Dict]:
         """
-        Filter out deployments configured with use_in_pass_through=True
+        Keep only deployments configured with use_in_pass_through=True.
 
         Args:
             healthy_deployments: List of healthy deployments
