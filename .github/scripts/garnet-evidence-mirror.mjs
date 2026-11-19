@@ -204,11 +204,15 @@ function upsert(body, block) {
   return `${body.trimEnd()}\n\n${block}\n`
 }
 
-async function main() {
+export async function main() {
   if (!process.env.GITHUB_TOKEN || !repo || !prNumber || !headSha) {
     throw new Error("GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required")
   }
   const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  if (pr.body?.includes("<!-- garnet:record-summary:opt-in -->")) {
+    console.log("PR opted into garnet-record-summary; not mirroring the full comment.")
+    return
+  }
   if (pr.head?.sha !== headSha) {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
     return
