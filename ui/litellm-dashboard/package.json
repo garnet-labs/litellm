@@ -6,7 +6,7 @@
     "dev": "next dev",
     "dev:webpack": "next dev --webpack",
     "build": "next build",
-    "generate:api-types": "tmp_dir=$(mktemp -d) && trap 'rm -rf \"$tmp_dir\"' EXIT && redocly bundle ../../litellm/proxy/openapi.json -o \"$tmp_dir/proxy-openapi.json\" && openapi-typescript \"$tmp_dir/proxy-openapi.json\" -o src/proxy-api.d.ts",
+    "generate:api-types": "tmp_dir=$(mktemp -d) && trap 'rm -rf \"$tmp_dir\"' EXIT && REDOCLY_TELEMETRY=off REDOCLY_SUPPRESS_UPDATE_NOTICE=true redocly bundle ../../litellm/proxy/openapi.json -o \"$tmp_dir/proxy-openapi.json\" && openapi-typescript \"$tmp_dir/proxy-openapi.json\" -o src/proxy-api.d.ts",
     "start": "next start",
     "lint": "next lint",
     "test": "vitest",
