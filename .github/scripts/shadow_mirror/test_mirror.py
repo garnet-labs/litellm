@@ -1,5 +1,8 @@
 import base64
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -13,6 +16,7 @@ from mirror import (
     APIError,
     Mirror,
     is_dependency_pr,
+    main,
     mirror_revision,
     recording_workflow,
     scrub_title,
@@ -270,6 +274,32 @@ class ReplayTest(unittest.TestCase):
                 "files": ["uv.lock"],
             },
         )
+        self.api.write.assert_not_called()
+
+    def test_missing_upstream_pr_does_not_abort_batch(self):
+        self.api.dry_run = True
+        self.api.call.side_effect = [
+            APIError("GET", "pulls/1", 404, "Not Found"),
+            self.pr,
+            self.pr,
+            {"merge_base_commit": {"sha": self.merge_base}},
+        ]
+        self.api.pages.side_effect = [[], self.files]
+        with (
+            patch("mirror.API", return_value=self.api),
+            patch(
+                "mirror.sys.argv",
+                ["mirror", "sync", "--dry-run", "--pr", "1", "--pr", "2"],
+            ),
+            patch.dict("mirror.os.environ", {"SHADOW_MIRROR_TOKEN": "unused"}),
+            redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(main(), 0)
+        results = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(
+            [(r["pr"], r["status"]) for r in results], [(1, "skipped"), (2, "dry-run")]
+        )
+        self.assertEqual(results[0]["reason"], "upstream PR not found")
         self.api.write.assert_not_called()
 
     def test_replaced_tree_has_only_the_recorder_in_workflows(self):

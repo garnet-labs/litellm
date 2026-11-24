@@ -204,11 +204,18 @@ class Mirror:
     def sync(self, number):
         api = self.api
         history = self.mirrors.get(number, {})
-        pr = api.call(SOURCE, f"pulls/{number}")
+        path = f"pulls/{number}"
+        try:
+            pr = api.call(SOURCE, path)
+            if pr["state"] == "open":
+                files = list(api.pages(SOURCE, f"{path}/files"))
+                current = api.call(SOURCE, path)
+        except APIError as error:
+            if error.status != 404:
+                raise
+            return {"status": "skipped", "reason": "upstream PR not found"}
         if pr["state"] != "open":
             return self.close(history, "source closed")
-        files = list(api.pages(SOURCE, f"pulls/{number}/files"))
-        current = api.call(SOURCE, f"pulls/{number}")
         if any(current[key] != pr[key] for key in ("state", "changed_files")) or any(
             current[key]["sha"] != pr[key]["sha"] for key in ("base", "head")
         ):
