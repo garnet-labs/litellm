@@ -122,6 +122,19 @@ class DiscoveryTest(unittest.TestCase):
             "Bump @scope/name",
         )
 
+    def test_scrub_title_cannot_recreate_ci_skip_directives(self):
+        for directive in (
+            "[skip  ci]",
+            "[ci\tskip]",
+            "[No\nCI]",
+            "[skip @user actions]",
+            "[actions [skip ci] skip]",
+        ):
+            with self.subTest(directive=directive):
+                self.assertEqual(
+                    scrub_title(f"Bump fastapi {directive}"), "Bump fastapi"
+                )
+
     def test_mirror_revision_requires_exact_same_repo_pair(self):
         pr = {
             "base": {"repo": {"full_name": FORK}, "ref": "shadow/base/1-r2"},

@@ -29,6 +29,9 @@ NPM_INSTALL_DIRS = {
     "vscode-extension",
 }
 NPM_INPUTS = {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
+CI_SKIP = re.compile(
+    r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]", re.IGNORECASE
+)
 DISCOVERY = """
 query ($cursor: String) {
   repository(owner: "BerriAI", name: "litellm") {
@@ -147,14 +150,11 @@ def is_dependency_pr(pr, files):
 def scrub_title(title):
     title = re.sub(r"https?://\S+|www\.\S+|#\d+", "", title)
     title = re.sub(re.escape(SOURCE), "", title, flags=re.IGNORECASE)
-    title = re.sub(
-        r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
     title = re.sub(r"(?<![\w/])@[\w.-]+(?![\w./-])", "", title)
-    return " ".join(title.split())[:256].rstrip() or "Dependency update"
+    title = " ".join(title.split())
+    while CI_SKIP.search(title):
+        title = " ".join(CI_SKIP.sub("", title).split())
+    return title[:256].rstrip() or "Dependency update"
 
 
 def recording_workflow(content):
