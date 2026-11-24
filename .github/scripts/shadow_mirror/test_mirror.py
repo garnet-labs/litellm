@@ -22,12 +22,12 @@ from mirror import (
 class DiscoveryTest(unittest.TestCase):
     def test_manifest_and_lockfile_only_changes(self):
         paths = (
-            "requirements-dev.txt",
             "pyproject.toml",
             "uv.lock",
-            "enterprise/poetry.lock",
+            "poetry.lock",
             "ui/litellm-dashboard/package.json",
             "litellm/ui/litellm-dashboard/package-lock.json",
+            "vscode-extension/package-lock.json",
         )
         pr = {
             "changed_files": len(paths),
@@ -40,7 +40,7 @@ class DiscoveryTest(unittest.TestCase):
         self.assertFalse(is_dependency_pr(pr, files))
 
     def test_named_apps_can_make_mixed_changes(self):
-        files = [{"filename": "README.md"}]
+        files = [{"filename": "README.md"}, {"filename": "uv.lock"}]
         for login, type_, qualified in (
             ("dependabot[bot]", "Bot", True),
             ("renovate[bot]", "Bot", True),
@@ -48,8 +48,23 @@ class DiscoveryTest(unittest.TestCase):
             ("another[bot]", "Bot", False),
         ):
             with self.subTest(login=login, type=type_):
-                pr = {"changed_files": 1, "user": {"login": login, "type": type_}}
+                pr = {"changed_files": 2, "user": {"login": login, "type": type_}}
                 self.assertEqual(is_dependency_pr(pr, files), qualified)
+
+    def test_unrecorded_inputs_do_not_qualify_for_bot_or_human(self):
+        for path in (
+            "docs/my-website/package-lock.json",
+            "enterprise/poetry.lock",
+            "requirements-dev.txt",
+            "ui/litellm-dashboard/yarn.lock",
+        ):
+            for user in (
+                {"login": "dependabot[bot]", "type": "Bot"},
+                {"login": "developer", "type": "User"},
+            ):
+                with self.subTest(path=path, user=user):
+                    pr = {"changed_files": 1, "user": user}
+                    self.assertFalse(is_dependency_pr(pr, [{"filename": path}]))
 
     def test_candidate_pages_keep_bots_and_verify_manifests_later(self):
         api = API("unused", True)
@@ -158,7 +173,12 @@ class ReplayTest(unittest.TestCase):
             raise AssertionError((repo, path))
 
         self.api.call.side_effect = read
-        self.files[0]["filename"] = "<!-- garnet:record-summary:opt-in -->/package.json"
+        self.pr.update(
+            changed_files=2, user={"login": "dependabot[bot]", "type": "Bot"}
+        )
+        self.files.append(
+            {"filename": "<!-- garnet:record-summary:opt-in -->/package.json"}
+        )
         self.api.pages.side_effect = [self.files, []]
         self.api.write.side_effect = [
             {"sha": "baseline"},

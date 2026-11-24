@@ -22,23 +22,13 @@ MARKER = re.compile(
 HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
 HOLD = f"{HOLD_MARKER}\n**HOLD** · The runtime record isn't available to this gate yet."
 DEPENDENCY_BOTS = {"dependabot[bot]", "renovate[bot]"}
-MANIFESTS = {
-    "package.json",
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    "pnpm-workspace.yaml",
-    "yarn.lock",
-    "bun.lock",
-    "bun.lockb",
-    "Cargo.toml",
-    "Cargo.lock",
-    "go.mod",
-    "go.sum",
-    "pyproject.toml",
-    "poetry.lock",
-    "uv.lock",
+PYTHON_INPUTS = {"pyproject.toml", "poetry.lock", "uv.lock"}
+NPM_INSTALL_DIRS = {
+    "ui/litellm-dashboard",
+    "litellm/ui/litellm-dashboard",
+    "vscode-extension",
 }
+NPM_INPUTS = {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
 DISCOVERY = """
 query ($cursor: String) {
   repository(owner: "BerriAI", name: "litellm") {
@@ -125,9 +115,9 @@ class API:
 
 
 def dependency_file(path):
-    name = path.rsplit("/", 1)[-1]
-    return name in MANIFESTS or bool(
-        re.fullmatch(r"(requirements|constraints)[^/]*\.txt", name)
+    directory, _, name = path.rpartition("/")
+    return path in PYTHON_INPUTS or (
+        directory in NPM_INSTALL_DIRS and name in NPM_INPUTS
     )
 
 
@@ -139,7 +129,11 @@ def is_dependency_pr(pr, files):
         author.get("login", "").lower() in DEPENDENCY_BOTS
         and author.get("type") == "Bot"
     ):
-        return True
+        return any(
+            dependency_file(file["filename"])
+            or dependency_file(file.get("previous_filename", ""))
+            for file in files
+        )
     return all(
         dependency_file(file["filename"])
         and (
@@ -222,7 +216,7 @@ class Mirror:
         if pr["changed_files"] != len(files):
             return {"status": "incomplete file list"}
         if not is_dependency_pr(pr, files):
-            return self.close(history, "not dependency-only or a dependency bot")
+            return self.close(history, "not an eligible recorded dependency change")
         upstream_head = pr["head"]["sha"]
         upstream_base = api.call(
             SOURCE, f'compare/{pr["base"]["sha"]}...{upstream_head}'
