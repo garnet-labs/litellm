@@ -54,7 +54,7 @@ jobs:
             echo "PR #${PR_NUMBER} is ${state}; nothing to do."
             exit 0
           fi
-          if jq -e '.head.ref | startswith("shadow/")' <<<"${pr}" >/dev/null; then
+          if jq -e '.base.ref | startswith("shadow/base/")' <<<"${pr}" >/dev/null; then
             echo "PR #${PR_NUMBER} is a shadow mirror; skipping evidence label."
             exit 0
           fi
