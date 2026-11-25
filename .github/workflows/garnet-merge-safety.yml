@@ -20,13 +20,32 @@ on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request co
 permissions: {}
 
 jobs:
-  merge-safety:
-    name: garnet/merge-safety
+  resolve:
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '<!-- garnet-runtime-review -->') &&
        contains(fromJSON('["garnet-runtime-review[bot]","garnet-ai[bot]"]'), github.event.comment.user.login))
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.check.outputs.eligible }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+        run: |
+          eligible=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.base.ref | startswith("shadow/base/") | not')
+          echo "eligible=${eligible}" >> "${GITHUB_OUTPUT}"
+
+  merge-safety:
+    name: garnet/merge-safety
+    needs: resolve
+    if: needs.resolve.outputs.eligible == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

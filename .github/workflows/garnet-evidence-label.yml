@@ -50,12 +50,16 @@ jobs:
           set -euo pipefail
           pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
           state=$(jq -r '.state' <<<"${pr}")
-          head=$(jq -r '.head.sha' <<<"${pr}")
-          has_label=$(jq -r --arg l "${LABEL}" 'any(.labels[]; .name == $l)' <<<"${pr}")
           if [ "${state}" != "open" ]; then
             echo "PR #${PR_NUMBER} is ${state}; nothing to do."
             exit 0
           fi
+          if jq -e '.base.ref | startswith("shadow/base/")' <<<"${pr}" >/dev/null; then
+            echo "PR #${PR_NUMBER} is a shadow mirror; skipping evidence label."
+            exit 0
+          fi
+          head=$(jq -r '.head.sha' <<<"${pr}")
+          has_label=$(jq -r --arg l "${LABEL}" 'any(.labels[]; .name == $l)' <<<"${pr}")
           # Trusted App comment, bound by garnet:commit to the current head, with a
           # finalized garnet:summary for that same commit. Anything else is "no
           # finalized record for this head": pending, stale, missing, or malformed.
