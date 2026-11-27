@@ -93,6 +93,19 @@ jobs:
           fi
           # Some revisions write the release-age cooldown as "3d", which npm 11 rejects; it reads whole days.
           npm_config_min_release_age=3 npm ci
+      - name: Check generated API types
+        shell: bash
+        run: |
+          if [ -f litellm/ui/litellm-dashboard/package-lock.json ]; then
+            cd litellm/ui/litellm-dashboard
+          elif [ -f ui/litellm-dashboard/package-lock.json ]; then
+            cd ui/litellm-dashboard
+          else
+            echo 'No dashboard package-lock.json found' >&2
+            exit 1
+          fi
+          npm run generate:api-types
+          git diff --exit-code -- src/proxy-api.d.ts
       - name: Let sensor settle
         if: always()
         run: sleep 30
