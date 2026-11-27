@@ -21,6 +21,17 @@ MARKER = re.compile(
 )
 HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
 HOLD = f"{HOLD_MARKER}\n**HOLD** · The runtime record isn't available to this gate yet."
+REVIEW_BOTS = {
+    "garnet-runtime-review[bot]",
+    "garnet-runtime-review-dev[bot]",
+    "garnet-ai[bot]",
+}
+REVIEW_MARKER = "<!-- garnet-runtime-review -->"
+REVIEW_OWNER = re.compile(
+    r"<!--\s*garnet-(?:control-plane|action)-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->"
+)
+REVIEW_COMMIT = re.compile(r"<!--\s*garnet:commit\s+([a-f0-9]{40})\s*-->")
+REVIEW_SUMMARY = re.compile(r"<!-- garnet:summary (\{[^\n]*\}) -->")
 DEPENDENCY_BOTS = {"dependabot[bot]", "renovate[bot]"}
 PYTHON_INPUTS = {"pyproject.toml", "poetry.lock", "uv.lock"}
 NPM_INSTALL_DIRS = {
@@ -43,6 +54,13 @@ query ($cursor: String) {
         files(first: 10) { nodes { path } }
       }
     }
+  }
+}
+"""
+MARK_READY = """
+mutation ($id: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+    pullRequest { isDraft }
   }
 }
 """
@@ -94,6 +112,22 @@ class API:
 
     def write(self, path, data, method="POST"):
         return self.call(FORK, path, method, data)
+
+    def mark_ready(self, pr, upstream_number):
+        if self.dry_run or mirror_revision(pr, upstream_number) is None:
+            raise ValueError("Only live writes to the mirror repository are allowed")
+        result = self._request(
+            "graphql", "POST", {"query": MARK_READY, "variables": {"id": pr["node_id"]}}
+        )
+        if result.get("errors"):
+            raise ValueError(
+                f'GitHub markPullRequestReadyForReview: {result["errors"]}'
+            )
+        mutation = (result.get("data") or {}).get("markPullRequestReadyForReview") or {}
+        if (mutation.get("pullRequest") or {}).get("isDraft") is not False:
+            raise ValueError(
+                "GitHub did not confirm the pull request is ready for review"
+            )
 
     def dependency_candidates(self):
         cursor = None
@@ -187,6 +221,29 @@ def mirror_revision(pr, number):
     return None
 
 
+def finalized_review(comment, head):
+    body = comment.get("body") or ""
+    if (
+        (comment.get("user") or {}).get("login") not in REVIEW_BOTS
+        or REVIEW_MARKER not in body
+        or not REVIEW_OWNER.search(body)
+    ):
+        return False
+    commit = REVIEW_COMMIT.search(body)
+    summary = REVIEW_SUMMARY.search(body)
+    if not commit or commit[1] != head or not summary:
+        return False
+    try:
+        record = json.loads(summary[1])
+    except ValueError:
+        return False
+    return (
+        isinstance(record, dict)
+        and record.get("commit") == head
+        and record.get("status") == "finalized"
+    )
+
+
 class Mirror:
     def __init__(self, api):
         self.api = api
@@ -275,8 +332,12 @@ class Mirror:
             upstream_base,
         ):
             self.hold(existing["number"])
+            ready = self.ready_if_finalized(existing, number, revision)
             self.close(history, "superseded", keep=existing["number"])
-            return {"status": "unchanged", "url": existing["html_url"]}
+            return {
+                "status": "ready" if ready else "unchanged",
+                "url": existing["html_url"],
+            }
 
         if not baseline:
             baseline = self.commit(self.tree(upstream_base), [], baseline_message)
@@ -318,13 +379,35 @@ class Mirror:
         if existing:
             result = api.write(f'pulls/{existing["number"]}', data, "PATCH")
         else:
-            result = api.write("pulls", {**data, "head": head_ref, "base": base_ref})
+            result = api.write(
+                "pulls", {**data, "head": head_ref, "base": base_ref, "draft": True}
+            )
         self.hold(result["number"])
         self.close(history, "superseded", keep=result["number"])
         return {
             "status": "updated" if existing else "created",
             "url": result["html_url"],
         }
+
+    def ready_if_finalized(self, pr, upstream_number, revision):
+        if not pr.get("draft"):
+            return False
+        head = pr["head"]["sha"]
+        path = f'issues/{pr["number"]}/comments'
+        if not any(
+            finalized_review(comment, head) for comment in self.api.pages(FORK, path)
+        ):
+            return False
+        current = self.api.call(FORK, f'pulls/{pr["number"]}')
+        if (
+            current["state"] != "open"
+            or not current.get("draft")
+            or mirror_revision(current, upstream_number) != revision
+            or current["head"]["sha"] != head
+        ):
+            return False
+        self.api.mark_ready(current, upstream_number)
+        return True
 
     def get_ref(self, name):
         try:

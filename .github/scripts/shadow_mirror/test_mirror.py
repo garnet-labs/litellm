@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import unittest
@@ -11,6 +12,7 @@ from mirror import (
     FORK,
     HOLD,
     HOLD_MARKER,
+    MARK_READY,
     SOURCE,
     WORKFLOW,
     APIError,
@@ -113,6 +115,35 @@ class DiscoveryTest(unittest.TestCase):
         for api, repo in ((API("unused", False), SOURCE), (API("unused", True), FORK)):
             with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
                 api.call(repo, "pulls", "POST", {})
+
+    def test_ready_mutation_only_accepts_live_mirror_pairs(self):
+        pr = {
+            "node_id": "PR_node",
+            "base": {"ref": "shadow/base/1", "repo": {"full_name": FORK}},
+            "head": {"ref": "shadow/pr/1", "repo": {"full_name": FORK}},
+        }
+        api = API("unused", True)
+        api._request = Mock()
+        with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
+            api.mark_ready(pr, 1)
+        api.dry_run = False
+        with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
+            api.mark_ready(
+                {**pr, "head": {**pr["head"], "repo": {"full_name": SOURCE}}}, 1
+            )
+        api._request.assert_not_called()
+        api._request.return_value = {
+            "data": {
+                "markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}
+            }
+        }
+        api.mark_ready(pr, 1)
+        api._request.assert_called_once_with(
+            "graphql", "POST", {"query": MARK_READY, "variables": {"id": "PR_node"}}
+        )
+        api._request.return_value = {"errors": [{"message": "permission denied"}]}
+        with self.assertRaisesRegex(ValueError, "permission denied"):
+            api.mark_ready(pr, 1)
 
     def test_scrub_title_removes_upstream_references(self):
         self.assertEqual(
@@ -228,10 +259,100 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(writes[2].args[1]["parents"], ["baseline"])
         self.assertEqual(writes[4].args[1]["base"], "shadow/base/1")
         self.assertEqual(writes[4].args[1]["head"], "shadow/pr/1")
+        self.assertIs(writes[4].args[1]["draft"], True)
         self.assertNotIn(
             "<!-- garnet:record-summary:opt-in -->", writes[4].args[1]["body"]
         )
         self.assertEqual(writes[5], call("issues/2/comments", {"body": HOLD}))
+        self.api.mark_ready.assert_not_called()
+
+    def test_later_sync_promotes_only_with_trusted_finalized_current_head(self):
+        head = "d" * 40
+        existing = {
+            "number": 2,
+            "node_id": "PR_node",
+            "html_url": "mirror",
+            "draft": True,
+            "state": "open",
+            "base": {"ref": "shadow/base/1", "repo": {"full_name": FORK}},
+            "head": {"ref": "shadow/pr/1", "repo": {"full_name": FORK}, "sha": head},
+            "body": (
+                f"<!-- garnet-shadow-mirror upstream=1 upstream_head={self.source_head} "
+                f"upstream_base={self.merge_base} -->"
+            ),
+        }
+
+        def evidence(
+            login="garnet-runtime-review[bot]",
+            head_marker=head,
+            summary_head=head,
+            status="finalized",
+            owned=True,
+        ):
+            summary = json.dumps({"commit": summary_head, "status": status})
+            body = [
+                "<!-- garnet-runtime-review -->",
+                f"<!-- garnet:commit {head_marker} -->",
+                f"<!-- garnet:summary {summary} -->",
+            ]
+            if owned:
+                body.append("<!-- garnet-control-plane-pr-comment:v1:app.garnet.ai -->")
+            return {"user": {"login": login}, "body": "\n".join(body)}
+
+        malformed = {
+            **evidence(),
+            "body": evidence()["body"].replace('"status"', "status"),
+        }
+        updated = {**existing, "head": {**existing["head"], "sha": self.source_head}}
+        cases = (
+            ("finalized", evidence(), existing, existing, True),
+            ("pending", evidence(status="pending"), existing, existing, False),
+            ("untrusted", evidence(login="contributor"), existing, existing, False),
+            ("no owner marker", evidence(owned=False), existing, existing, False),
+            (
+                "stale marker",
+                evidence(head_marker=self.source_head),
+                existing,
+                existing,
+                False,
+            ),
+            (
+                "stale summary",
+                evidence(summary_head=self.source_head),
+                existing,
+                existing,
+                False,
+            ),
+            ("malformed", malformed, existing, existing, False),
+            ("head moved", evidence(), existing, updated, False),
+            (
+                "already ready",
+                evidence(),
+                {**existing, "draft": False},
+                existing,
+                False,
+            ),
+        )
+        self.mirror.workflow = "trusted workflow"
+        fingerprint = hashlib.sha256(self.mirror.workflow.encode()).hexdigest()
+        baseline = {
+            "message": f"chore: shadow baseline\n\nSource tree at {self.merge_base}; recorder {fingerprint}"
+        }
+        for name, comment, listed, current, promoted in cases:
+            with self.subTest(name=name):
+                self.api.reset_mock()
+                self.api.call.side_effect = [baseline, current]
+                self.api.pages.return_value = [{"body": HOLD}, comment]
+                with patch.object(self.mirror, "get_ref", return_value="mirror-base"):
+                    result = self.mirror.replay(
+                        1, self.pr, self.files, self.merge_base, {1: listed}
+                    )
+                self.assertEqual(result["status"], "ready" if promoted else "unchanged")
+                if promoted:
+                    self.api.mark_ready.assert_called_once_with(current, 1)
+                else:
+                    self.api.mark_ready.assert_not_called()
+                self.api.write.assert_not_called()
 
     def test_changed_base_creates_new_pair_without_updating_open_refs(self):
         old = {"state": "open", "number": 5, "body": "original"}
