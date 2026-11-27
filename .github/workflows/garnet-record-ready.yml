@@ -1,8 +1,6 @@
 # Success-only "record ready" signal for reviewers that start after a CI check.
-# Waits until the pull request description carries the Garnet evidence block
-# for this head commit in its finalized state (reviewers read the description),
-# then exits 0. With no finalized record within 45 minutes it fails, so a
-# reviewer that starts after this check never runs without evidence.
+# Requires a finalized Garnet App comment for the current PR head. Also waits
+# for the description mirror unless the PR opts into the compact summary.
 # It runs no pull request code and has no sensor.
 name: Garnet record ready
 
@@ -28,25 +26,44 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      - name: Wait for the finalized head-bound evidence block in the description
+      - name: Wait for a finalized Garnet Runtime Review for the current head
         shell: bash
         run: |
           set -uo pipefail
           deadline=$(( $(date +%s) + 45 * 60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" 2>/dev/null || true)
-            if printf '%s\n' "$pr" | jq -e '(.body // "") | contains("<!-- garnet:record-summary:opt-in -->")' >/dev/null; then
-              echo "PR opted into garnet-record-summary; skipping the full-evidence description check."
-              exit 0
+            current_head=$(printf '%s\n' "$pr" | jq -r '.head.sha // ""')
+            if [[ -n "$current_head" && "$current_head" != "$HEAD_SHA" ]]; then
+              echo "PR head changed; this check cannot attest the current head."
+              exit 1
             fi
             body=$(printf '%s\n' "$pr" | jq -r '.body // ""')
             block=$(printf '%s\n' "$body" | sed -n '/<!-- garnet:evidence:begin -->/,/<!-- garnet:evidence:end -->/p')
-            if printf '%s\n' "$block" | grep -F "garnet:commit ${HEAD_SHA}" >/dev/null \
-              && printf '%s\n' "$block" | grep -F '"status":"finalized"' >/dev/null; then
-              echo "Finalized Garnet evidence for ${HEAD_SHA} is in the description."
+            if [[ "$current_head" == "$HEAD_SHA" ]] \
+              && { [[ "$body" == *'<!-- garnet:record-summary:opt-in -->'* ]] \
+                || { grep -F "garnet:commit ${HEAD_SHA}" <<< "$block" >/dev/null \
+                  && grep -F '"status":"finalized"' <<< "$block" >/dev/null; }; } \
+              && gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+                | jq -e --arg head "$HEAD_SHA" '
+                    any(.[][]; . as $comment
+                      | (["garnet-runtime-review[bot]", "garnet-runtime-review-dev[bot]", "garnet-ai[bot]"]
+                         | index($comment.user.login)) != null
+                      and (($comment.body // "")
+                        | contains("<!-- garnet-runtime-review -->")
+                        and test("<!--\\s*garnet-(control-plane|action)-pr-comment:v1(:[a-z0-9.-]+)?\\s*-->")
+                        and test("<!--\\s*garnet:commit\\s+" + $head + "\\s*-->")
+                        and any(
+                          capture("<!-- garnet:summary (?<json>\\{[^\\n]*\\}) -->").json
+                          | fromjson?;
+                          .status == "finalized" and .commit == $head
+                        )))
+                  ' >/dev/null \
+              && [[ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')" == "$HEAD_SHA" ]]; then
+              echo "Finalized Garnet evidence for ${HEAD_SHA} is ready."
               exit 0
             fi
             sleep 15
           done
-          echo "No finalized Garnet evidence for ${HEAD_SHA} in the description within 45 minutes."
+          echo "No finalized Garnet evidence for ${HEAD_SHA} was ready within 45 minutes."
           exit 1
