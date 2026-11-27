@@ -1,0 +1,101 @@
+import types
+from collections.abc import Mapping, Sequence
+from typing import Final
+
+from litellm.llms.base_llm.chat.transformation import BaseConfig
+from litellm.llms.bedrock.chat.invoke_transformations.base_invoke_transformation import (
+    AmazonInvokeConfig,
+)
+
+
+class AmazonAI21Config(AmazonInvokeConfig, BaseConfig):
+    """
+    Reference: https://us-west-2.console.aws.amazon.com/bedrock/home?region=us-west-2#/providers?model=j2-ultra
+
+    Supported Params for the Amazon / AI21 models:
+
+    - `maxTokens` (int32): The maximum number of tokens to generate per result. Optional, default is 16. If no `stopSequences` are given, generation stops after producing `maxTokens`.
+
+    - `temperature` (float): Modifies the distribution from which tokens are sampled. Optional, default is 0.7. A value of 0 essentially disables sampling and results in greedy decoding.
+
+    - `topP` (float): Used for sampling tokens from the corresponding top percentile of probability mass. Optional, default is 1. For instance, a value of 0.9 considers only tokens comprising the top 90% probability mass.
+
+    - `stopSequences` (array of strings): Stops decoding if any of the input strings is generated. Optional.
+
+    - `frequencyPenalty` (object): Placeholder for frequency penalty object.
+
+    - `presencePenalty` (object): Placeholder for presence penalty object.
+
+    - `countPenalty` (object): Placeholder for count penalty object.
+    """
+
+    maxTokens: int | None = None
+    temperature: float | None = None
+    topP: float | None = None
+    stopSequences: list | None = None
+    frequencePenalty: dict | None = None
+    presencePenalty: dict | None = None
+    countPenalty: dict | None = None
+
+    def __init__(
+        self,
+        maxTokens: int | None = None,
+        temperature: float | None = None,
+        topP: float | None = None,
+        stopSequences: Sequence[object] | None = None,
+        frequencePenalty: Mapping[str, object] | None = None,
+        presencePenalty: Mapping[str, object] | None = None,
+        countPenalty: Mapping[str, object] | None = None,
+    ) -> None:
+        locals_: Final[Mapping[str, object]] = dict(locals())
+        for key, value in locals_.items():
+            if key != "self" and value is not None:
+                setattr(self.__class__, key, value)
+
+        AmazonInvokeConfig.__init__(self)
+
+    @classmethod
+    def get_config(cls):
+        class_attributes: Final[Mapping[str, object]] = types.MappingProxyType(cls.__dict__)
+        return {
+            k: v
+            for k, v in class_attributes.items()
+            if not k.startswith("__")
+            and not k.startswith("_abc")
+            and not isinstance(
+                v,
+                (
+                    types.FunctionType,
+                    types.BuiltinFunctionType,
+                    classmethod,
+                    staticmethod,
+                ),
+            )
+            and v is not None
+        }
+
+    def get_supported_openai_params(self, model: str) -> list[str]:
+        return [
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stream",
+        ]
+
+    def map_openai_params(
+        self,
+        non_default_params: Mapping[str, object],
+        optional_params: dict[str, object],
+        model: str,
+        drop_params: bool,
+    ) -> dict[str, object]:
+        for k, v in non_default_params.items():
+            if k == "max_tokens":
+                optional_params["maxTokens"] = v
+            if k == "temperature":
+                optional_params["temperature"] = v
+            if k == "top_p":
+                optional_params["topP"] = v
+            if k == "stream":
+                optional_params["stream"] = v
+        return optional_params

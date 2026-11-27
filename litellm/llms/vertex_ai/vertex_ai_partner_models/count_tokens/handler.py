@@ -1,0 +1,290 @@
+"""
+Token counter for Vertex AI Partner Models (Anthropic Claude, Meta Llama)
+
+This handler provides token counting for partner models hosted on Vertex AI.
+Unlike Gemini models which use Google's token counting API, partner models use
+their respective publisher-specific count-tokens endpoints.
+"""
+
+from collections.abc import Mapping, Sequence
+from typing import Any, Final, Protocol
+
+from pydantic import JsonValue, TypeAdapter
+
+from litellm.anthropic_beta_headers_manager import aload_beta_headers_config, filter_and_transform_beta_headers
+from litellm.litellm_core_utils.core_helpers import (
+    decoded_json_object,
+    drops_unsupported_params,
+    json_contains,
+    require_attributes,
+    subscript,
+)
+from litellm.litellm_core_utils.url_utils import join_api_base
+from litellm.llms.anthropic.common_utils import (
+    OBJECT_LIST_ADAPTER,
+    AnthropicModelInfo,
+    anthropic_message_objects,
+    context_management_betas,
+    count_tokens_feature_betas,
+    is_claude_model_target,
+    json_message_without_provider_specific_fields,
+    strip_unsigned_thinking_from_anthropic_messages,
+    tools_without_custom_field,
+)
+from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
+from litellm.llms.vertex_ai.common_utils import get_vertex_base_url
+from litellm.llms.vertex_ai.responses.transformation import is_vertex_muse_model
+from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+
+_COUNT_TOKENS_PUBLISHERS: Final = (
+    ("claude", "anthropic"),
+    ("llama", "meta"),
+    ("meta/", "meta"),
+)
+
+
+_REQUEST_MESSAGES: Final = TypeAdapter(Sequence[object])
+_JSON_LIST: Final = TypeAdapter(list[JsonValue])
+_CONTEXT_MANAGEMENT: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+_DECODED_JSON: Final = TypeAdapter(object)
+
+
+def count_tokens_request_body(
+    request_data: Mapping[str, object], model: str, drop_params: object
+) -> Mapping[str, object]:
+    claude: Final = is_claude_model_target("vertex_ai", model)
+    messages: Final = request_data.get("messages")
+    claude_messages: Final = (
+        anthropic_message_objects(_JSON_LIST.validate_python(messages))
+        if claude and isinstance(messages, list)
+        else None
+    )
+    tools: Final = request_data.get("tools")
+    return {
+        **request_data,
+        **(
+            {}
+            if claude_messages is None
+            else {
+                "messages": [
+                    json_message_without_provider_specific_fields(message)
+                    for message in strip_unsigned_thinking_from_anthropic_messages(claude_messages)
+                ]
+            }
+        ),
+        **(
+            {
+                "tools": tools_without_custom_field(
+                    OBJECT_LIST_ADAPTER.validate_python(tools),
+                    hoist_defer_loading=claude,
+                    drop_custom=drops_unsupported_params(drop_params),
+                )
+            }
+            if isinstance(tools, list)
+            else {}
+        ),
+    }
+
+
+class _SplitsOnSeparator(Protocol):
+    def split(self, sep: str, /) -> object: ...
+
+
+def _model_without_version_suffix(model: object) -> object:
+    if not json_contains(model, "@"):
+        return model
+    return subscript(require_attributes(model, _SplitsOnSeparator, "split").split("@"), 0)
+
+
+def count_tokens_publisher(model: str) -> str | None:
+    if is_vertex_muse_model(model):
+        return None
+    return next((publisher for marker, publisher in _COUNT_TOKENS_PUBLISHERS if marker in model), None)
+
+
+def count_tokens_headers(access_token: str, request_data: Mapping[str, object]) -> Mapping[str, str]:
+    authorization: Final = {"Authorization": f"Bearer {access_token}"}
+    betas: Final = (
+        *count_tokens_feature_betas(
+            "vertex_ai", request_data, _REQUEST_MESSAGES.validate_python(request_data["messages"])
+        ),
+        *filter_and_transform_beta_headers(
+            [
+                *context_management_betas(_CONTEXT_MANAGEMENT.validate_python(request_data.get("context_management"))),
+                *AnthropicModelInfo().thinking_betas(request_data.get("thinking")),
+            ],
+            "vertex_ai",
+        ),
+    )
+    return {**authorization, "anthropic-beta": ",".join(betas)} if betas else authorization
+
+
+class VertexAIPartnerModelsTokenCounter(VertexBase):
+    """
+    Token counter for Vertex AI Partner Models.
+
+    Handles token counting for models like Claude (Anthropic) and Llama (Meta)
+    that are available through Vertex AI's partner model program.
+    """
+
+    def _get_publisher_for_model(self, model: str) -> str:
+        publisher: Final = count_tokens_publisher(model)
+        if publisher is None:
+            raise ValueError(f"Unknown partner model: {model}")
+        return publisher
+
+    def _build_count_tokens_endpoint(
+        self,
+        model: str,
+        project_id: str,
+        vertex_location: str,
+        api_base: str | None = None,
+    ) -> str:
+        """
+        Build the count-tokens endpoint URL for a partner model.
+
+        Args:
+            model: The model name
+            project_id: Google Cloud project ID
+            vertex_location: Vertex AI location (e.g., "us-east5")
+            api_base: Optional custom API base URL
+
+        Returns:
+            Full endpoint URL for the count-tokens API
+        """
+        publisher: Final = self._get_publisher_for_model(model)
+
+        # Use custom api_base if provided, otherwise construct default
+        base_url: Final = api_base or get_vertex_base_url(vertex_location)
+
+        # Construct the count-tokens endpoint
+        # Format: /v1/projects/{project}/locations/{location}/publishers/{publisher}/models/count-tokens:rawPredict
+        endpoint: Final = join_api_base(
+            base_url,
+            f"v1/projects/{project_id}/locations/{vertex_location}/"
+            f"publishers/{publisher}/models/count-tokens:rawPredict",
+        )
+
+        return endpoint
+
+    @staticmethod
+    def _strip_version_suffix(model: str) -> str:
+        """
+        Strip version suffixes (e.g. @default, @20251001) from model names.
+
+        The Vertex AI count-tokens endpoint rejects model names that include
+        version suffixes — for example, "claude-sonnet-4-6@default" returns
+        "not supported for token counting" while "claude-sonnet-4-6" works.
+        """
+        if "@" in model:
+            return model.split("@")[0]
+        return model
+
+    async def handle_count_tokens_request(
+        self,
+        model: str,
+        request_data: Mapping[str, object],
+        litellm_params: dict[str, Any],
+    ) -> dict[str, object]:
+        """
+        Handle token counting request for a Vertex AI partner model.
+
+        Args:
+            model: The model name
+            request_data: Request payload (Anthropic Messages API format)
+            litellm_params: LiteLLM parameters containing credentials, project, location
+
+        Returns:
+            Dict containing token count information
+
+        Raises:
+            ValueError: If required parameters are missing or invalid
+        """
+        # Strip version suffixes (@default, @20251001, etc.) — the Vertex AI
+        # count-tokens endpoint does not accept versioned model names.
+        model = self._strip_version_suffix(model)
+        if "model" in request_data:
+            requested_model: Final = request_data["model"]
+            request_data = {
+                **request_data,
+                "model": (
+                    self._strip_version_suffix(requested_model)
+                    if isinstance(requested_model, str)
+                    else _model_without_version_suffix(requested_model)
+                ),
+            }
+
+        # Validate request
+        if "messages" not in request_data:
+            raise ValueError("messages required for token counting")
+
+        # Extract Vertex AI credentials and settings
+        vertex_credentials: Final = self.get_vertex_ai_credentials(litellm_params)
+        vertex_project: Final = self.get_vertex_ai_project(litellm_params)
+
+        # Check for count_tokens specific location override
+        vertex_count_tokens_location: Final = litellm_params.get("vertex_count_tokens_location")
+        vertex_location_raw: Final = self.get_vertex_ai_location(litellm_params)
+
+        # Determine final location with precedence:
+        # 1. vertex_count_tokens_location (if provided)
+        # 2. vertex_location (if provided)
+        # 3. Default to us-east5 for Claude models when no location is set
+        # Supported regions: us-east5, europe-west1, asia-southeast1
+        # https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/count-tokens
+        if vertex_count_tokens_location:
+            vertex_location: str = vertex_count_tokens_location
+        elif vertex_location_raw:
+            vertex_location = vertex_location_raw
+        elif "claude" in model.lower():
+            vertex_location = "us-east5"
+        else:
+            vertex_location = "us-east5"
+
+        # Get access token and resolved project ID
+        access_token, project_id = await self._ensure_access_token_async(
+            credentials=vertex_credentials,
+            project_id=vertex_project,
+            custom_llm_provider="vertex_ai",
+        )
+
+        # Build the endpoint URL
+        endpoint_url: Final = self._build_count_tokens_endpoint(
+            model=model,
+            project_id=project_id,
+            vertex_location=vertex_location,
+            api_base=litellm_params.get("api_base"),
+        )
+
+        if request_data.get("context_management") is not None:
+            await aload_beta_headers_config()
+        headers: Final = dict(count_tokens_headers(access_token, request_data))
+
+        # Get async HTTP client
+        from litellm import LlmProviders
+
+        async_client: Final = get_async_httpx_client(llm_provider=LlmProviders.VERTEX_AI)
+
+        # Make the request
+        # Note: Partner models (especially Claude) accept Anthropic Messages API format directly
+        response: Final = await async_client.post(
+            endpoint_url,
+            headers=headers,
+            json=dict(count_tokens_request_body(request_data, model, litellm_params.get("drop_params"))),
+            timeout=30.0,
+        )
+
+        # Check for errors
+        if response.status_code != 200:
+            error_text: Final = response.text
+            raise ValueError(f"Token counting request failed with status {response.status_code}: {error_text}")
+
+        # Parse response
+        result: Final = decoded_json_object(_DECODED_JSON.validate_python(response.json()))
+
+        # Return token count
+        # Vertex AI Anthropic returns: {"input_tokens": 123}
+        return {
+            "input_tokens": result.get("input_tokens", 0),
+            "tokenizer_used": "vertex_ai_partner_models",
+        }

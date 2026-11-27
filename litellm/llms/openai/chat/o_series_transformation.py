@@ -1,0 +1,211 @@
+"""
+Support for o1/o3 model family
+
+https://platform.openai.com/docs/guides/reasoning
+
+Translations handled by LiteLLM:
+- modalities: image => drop param (if user opts in to dropping param)
+- role: system ==> translate to role 'user'
+- streaming => faked by LiteLLM
+- Tools, response_format =>  drop param (if user opts in to dropping param)
+- Logprobs => drop param (if user opts in to dropping param)
+"""
+
+from collections.abc import Collection, Coroutine, Sequence
+from typing import Final, Literal, cast, overload
+
+import litellm
+from litellm import verbose_logger
+from litellm._logging import WarningLogger
+from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+from litellm.types.llms.openai import AllMessageValues, ChatCompletionUserMessage
+from litellm.utils import (
+    is_explicitly_disabled_factory,
+    supports_function_calling,
+    supports_parallel_function_calling,
+    supports_response_schema,
+    supports_system_messages,
+)
+
+from .gpt_reasoning_transformation import (
+    get_effort_level,
+    refused_reasoning_effort_warning,
+    unsupported_reasoning_effort_message,
+)
+from .gpt_transformation import OpenAIGPTConfig
+
+
+class OpenAIOSeriesConfig(OpenAIGPTConfig):
+    """
+    Reference: https://platform.openai.com/docs/guides/reasoning
+    """
+
+    @classmethod
+    def get_config(cls):
+        return super().get_config()
+
+    def translate_developer_role_to_system_role(
+        self,
+        messages: Sequence[AllMessageValues],
+        *,
+        model: str,
+        custom_llm_provider: str | None,
+        api_base: str | None,
+        model_info: object,
+    ) -> Sequence[AllMessageValues]:
+        """
+        O-series models support `developer` role.
+        """
+        return messages
+
+    def get_supported_openai_params(self, model: str) -> list[str]:
+        """
+        Get the supported OpenAI params for the given model
+
+        """
+
+        all_openai_params: Final[list[str]] = super().get_supported_openai_params(model=model)
+        non_supported_params: Final = [
+            "logprobs",
+            "top_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "top_logprobs",
+        ]
+
+        o_series_only_param: Final = ["reasoning_effort"]
+
+        all_openai_params.extend(o_series_only_param)
+
+        try:
+            model, custom_llm_provider, _, _ = get_llm_provider(model=model)
+        except Exception:
+            verbose_logger.debug(
+                "Unable to infer model provider for model=%s, defaulting to openai for o1 supported param check", model
+            )
+            custom_llm_provider = "openai"
+
+        _supports_function_calling: Final = supports_function_calling(model, custom_llm_provider)
+        _supports_response_schema: Final = supports_response_schema(model, custom_llm_provider)
+        _supports_parallel_tool_calls: Final = supports_parallel_function_calling(model, custom_llm_provider)
+
+        if not _supports_function_calling:
+            non_supported_params.append("tools")
+            non_supported_params.append("tool_choice")
+            non_supported_params.append("function_call")
+            non_supported_params.append("functions")
+
+        if not _supports_parallel_tool_calls:
+            non_supported_params.append("parallel_tool_calls")
+
+        if not _supports_response_schema:
+            non_supported_params.append("response_format")
+
+        return [param for param in all_openai_params if param not in non_supported_params]
+
+    def map_openai_params(
+        self,
+        non_default_params: dict,
+        optional_params: dict[str, object],
+        model: str,
+        drop_params: bool,
+        *,
+        declared_reasoning_efforts: Collection[str] | None = None,
+        allowed_openai_params: Collection[str] = (),
+        reasoning_drop_logger: WarningLogger = verbose_logger,
+    ):
+        requested_effort: Final = get_effort_level(
+            non_default_params.get("reasoning_effort") or optional_params.get("reasoning_effort")  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # the request params arrive as a bare dict
+        )
+        refused_effort: Final = (
+            requested_effort
+            if requested_effort is not None
+            and requested_effort not in (declared_reasoning_efforts or ())
+            and "reasoning_effort" not in allowed_openai_params
+            and is_explicitly_disabled_factory(
+                model=model, custom_llm_provider=None, key=f"supports_{requested_effort}_reasoning_effort"
+            )
+            else None
+        )
+        if refused_effort is not None:
+            if not (litellm.drop_params or drop_params):
+                raise litellm.utils.UnsupportedParamsError(
+                    message=unsupported_reasoning_effort_message("reasoning_effort", refused_effort, model),
+                    status_code=400,
+                    body={"param": "reasoning_effort", "code": "unsupported_value"},
+                )
+            reasoning_drop_logger.warning(
+                refused_reasoning_effort_warning(
+                    suggest_declared_levels=declared_reasoning_efforts is not None, suggest_base_model=False
+                ),
+                "reasoning_effort",
+                refused_effort,
+                model,
+                model,
+            )
+        if "max_tokens" in non_default_params:
+            optional_params["max_completion_tokens"] = non_default_params.pop("max_tokens")
+        if "temperature" in non_default_params:
+            temperature_value: Final[float | None] = non_default_params.pop("temperature")
+            if temperature_value is not None:
+                if temperature_value == 1:
+                    optional_params["temperature"] = temperature_value
+                else:
+                    ## UNSUPPORTED TOOL CHOICE VALUE
+                    if litellm.drop_params is True or drop_params is True:
+                        pass
+                    else:
+                        raise litellm.utils.UnsupportedParamsError(
+                            message=f"O-series models don't support temperature={temperature_value}. Only temperature=1 is supported. To drop unsupported openai params from the call, set `litellm.drop_params = True`",
+                            status_code=400,
+                        )
+
+        mapped_params: Final = super()._map_openai_params(non_default_params, optional_params, model, drop_params)
+        if refused_effort is None:
+            return mapped_params
+        return {param: value for param, value in mapped_params.items() if param != "reasoning_effort"}
+
+    def _with_provider_roles(self, messages: Sequence[AllMessageValues], model: str) -> Sequence[AllMessageValues]:
+        keeps_system_messages: Final = supports_system_messages(model, "openai")
+        return tuple(
+            message
+            if keeps_system_messages or message["role"] != "system"
+            else ChatCompletionUserMessage(content=message["content"], role="user")
+            for message in messages
+        )
+
+    def is_model_o_series_model(self, model: str) -> bool:
+        model = model.split("/")[-1]  # could be "openai/o3" or "o3"
+        return (
+            len(model) > 1
+            and model[0] == "o"
+            and model[1].isdigit()
+            and model in litellm.open_ai_chat_completion_models
+        )
+
+    @overload
+    def _transform_messages(
+        self, messages: list[AllMessageValues], model: str, is_async: Literal[True]
+    ) -> Coroutine[object, object, list[AllMessageValues]]: ...
+
+    @overload
+    def _transform_messages(
+        self,
+        messages: list[AllMessageValues],
+        model: str,
+        is_async: Literal[False] = False,
+    ) -> list[AllMessageValues]: ...
+
+    def _transform_messages(
+        self, messages: list[AllMessageValues], model: str, is_async: bool = False
+    ) -> list[AllMessageValues] | Coroutine[object, object, list[AllMessageValues]]:
+        """
+        Handles limitations of O-1 model family.
+        - modalities: image => drop param (if user opts in to dropping param)
+        - role: system ==> translate to role 'user'
+        """
+        transformed_messages: Final = list(self._with_provider_roles(messages, model))
+        if is_async:
+            return super()._transform_messages(transformed_messages, model, is_async=cast(Literal[True], True))
+        else:
+            return super()._transform_messages(transformed_messages, model, is_async=cast(Literal[False], False))

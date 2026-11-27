@@ -1,0 +1,96 @@
+from typing import Final
+
+import click
+import rich
+
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, iter_items, require_get
+
+from ... import UsersManagementClient
+from ._cli_context import cli_context_values
+from .auth import joined_names
+
+
+@click.group()
+def users():
+    """Manage users on your LiteLLM proxy server"""
+
+
+@users.command("list")
+@click.pass_context
+def list_users(ctx: click.Context):
+    """List all users"""
+    context: Final = cli_context_values(ctx)
+    client: Final = UsersManagementClient(base_url=context["base_url"], api_key=context["api_key"])
+    listed: Final = client.list_users()
+    wrapped: Final = as_str_mapping(listed)
+    users: Final = wrapped["users"] if isinstance(wrapped, dict) and "users" in wrapped else listed
+    if not users:
+        click.echo("No users found.")
+        return
+    from rich.console import Console
+    from rich.table import Table
+
+    table: Final = Table(title="Users")
+    table.add_column("User ID", style="cyan")
+    table.add_column("Email", style="green")
+    table.add_column("Role", style="magenta")
+    table.add_column("Teams", style="yellow")
+    for user in iter_items(users):
+        row = require_get(user)
+        table.add_row(
+            str(row.get("user_id", "")),
+            str(row.get("user_email", "")),
+            str(row.get("user_role", "")),
+            joined_names(row.get("teams", []) or []),
+        )
+    console: Final = Console()
+    console.print(table)
+
+
+@users.command("get")
+@click.option("--id", "user_id", help="ID of the user to retrieve")
+@click.pass_context
+def get_user(ctx: click.Context, user_id: str):
+    """Get information about a specific user"""
+    context: Final = cli_context_values(ctx)
+    client: Final = UsersManagementClient(base_url=context["base_url"], api_key=context["api_key"])
+    result: Final = client.get_user(user_id=user_id)
+    rich.print_json(data=result)
+
+
+@users.command("create")
+@click.option("--email", required=True, help="User email")
+@click.option("--role", default="internal_user", help="User role")
+@click.option("--alias", default=None, help="User alias")
+@click.option("--team", multiple=True, help="Team IDs (can specify multiple)")
+@click.option("--max-budget", type=float, default=None, help="Max budget for user")
+@click.pass_context
+def create_user(
+    ctx: click.Context, email: str, role: str, alias: str | None, team: tuple[str, ...], max_budget: float | None
+):
+    """Create a new user"""
+    context: Final = cli_context_values(ctx)
+    client: Final = UsersManagementClient(base_url=context["base_url"], api_key=context["api_key"])
+    user_data: Final[dict[str, object]] = {
+        "user_email": email,
+        "user_role": role,
+    }
+    if alias:
+        user_data["user_alias"] = alias
+    if team:
+        user_data["teams"] = list(team)
+    if max_budget is not None:
+        user_data["max_budget"] = max_budget
+    result: Final = client.create_user(user_data)
+    rich.print_json(data=result)
+
+
+@users.command("delete")
+@click.argument("user_ids", nargs=-1)
+@click.pass_context
+def delete_user(ctx: click.Context, user_ids: tuple[str, ...]):
+    """Delete one or more users by user_id"""
+    context: Final = cli_context_values(ctx)
+    client: Final = UsersManagementClient(base_url=context["base_url"], api_key=context["api_key"])
+    result: Final = client.delete_user(list(user_ids))
+    rich.print_json(data=result)

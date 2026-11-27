@@ -1,0 +1,511 @@
+import base64
+import binascii
+import ctypes
+import os
+from collections.abc import Mapping
+from typing import Final, Literal, Protocol, TypeVar, cast, overload
+
+from pydantic import TypeAdapter, ValidationError
+
+from litellm._logging import verbose_proxy_logger
+from litellm.proxy.auth.master_key_boot_check import SALT_KEY_ENV_VAR
+from litellm.proxy.common_utils.fips import KEY_DERIVATION_KEY_RULE, fips_mode_active, key_derivation_key
+
+# Versioned ciphertext marker for AES-256-GCM values.
+# Format: "v2:gcm:" + base64url(nonce(12) || ciphertext || tag(16)).
+# Legacy XSalsa20-Poly1305 (nacl) values carry no marker; the colon in the
+# prefix can never appear in base64url(nacl output), so the prefix check is an
+# unambiguous discriminator between the two formats on read.
+V2_GCM_PREFIX: Final = "v2:gcm:"
+
+_V2_GCM_PREFIX: Final = V2_GCM_PREFIX
+
+# general_settings key selecting the at-rest encryption algorithm for new writes.
+# Default preserves the legacy algorithm so existing deployments are byte-for-byte
+# unchanged until they explicitly opt in. Decrypt is always format-detecting, so
+# flipping this flag forward (or back) never strands previously-written data.
+ENCRYPTION_ALGORITHM_SETTING: Final = "encryption_algorithm"
+
+_ENCRYPTION_ALGORITHM_SETTING: Final = ENCRYPTION_ALGORITHM_SETTING
+ALGO_AES_GCM: Final = "aes-256-gcm"
+
+_ALGO_AES_GCM: Final = ALGO_AES_GCM
+_ALGO_XSALSA20: Final = "xsalsa20-poly1305"
+
+
+def get_salt_key() -> str | None:
+    from litellm.proxy.proxy_server import master_key
+
+    salt_key = os.getenv("LITELLM_SALT_KEY", None)
+
+    if salt_key is None:
+        salt_key = master_key
+
+    return salt_key
+
+
+_get_salt_key: Final = get_salt_key
+
+_OSSL_PARAM_UTF8_STRING: Final = 4
+_OSSL_PARAM_OCTET_STRING: Final = 5
+_OSSL_PARAM_UNMODIFIED: Final = ctypes.c_size_t(-1).value
+_DERIVED_KEY_BYTES: Final = 32
+_FIPS_PROPERTIES: Final = b"fips=yes"
+
+
+class _KdfFetch(Protocol):
+    def __call__(self, libctx: None, algorithm: bytes, properties: bytes, /) -> int | None: ...
+
+
+class _KdfCtxNew(Protocol):
+    def __call__(self, kdf: int | None, /) -> int | None: ...
+
+
+class _CipherFetch(Protocol):
+    def __call__(self, libctx: None, algorithm: bytes, properties: bytes, /) -> int | None: ...
+
+
+class _CipherCtxNew(Protocol):
+    def __call__(self, /) -> int | None: ...
+
+
+class _OsslParam(ctypes.Structure):
+    _fields_ = (
+        ("key", ctypes.c_char_p),
+        ("data_type", ctypes.c_uint),
+        ("data", ctypes.c_char_p),
+        ("data_size", ctypes.c_size_t),
+        ("return_size", ctypes.c_size_t),
+    )
+
+
+def _param(name: bytes, data_type: int, data: bytes) -> _OsslParam:
+    return _OsslParam(name, data_type, data, len(data), _OSSL_PARAM_UNMODIFIED)
+
+
+def _kdf_fetch_function(libcrypto: ctypes.CDLL) -> _KdfFetch:
+    return ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)(
+        ("EVP_KDF_fetch", libcrypto)
+    )
+
+
+def _kdf_ctx_new_function(libcrypto: ctypes.CDLL) -> _KdfCtxNew:
+    return ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(("EVP_KDF_CTX_new", libcrypto))
+
+
+def _cipher_fetch_function(libcrypto: ctypes.CDLL) -> _CipherFetch:
+    return ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)(
+        ("EVP_CIPHER_fetch", libcrypto)
+    )
+
+
+def _cipher_ctx_new_function(libcrypto: ctypes.CDLL) -> _CipherCtxNew:
+    return ctypes.CFUNCTYPE(ctypes.c_void_p)(("EVP_CIPHER_CTX_new", libcrypto))
+
+
+def _kbkdf_hmac_sha256(key: bytes, label: bytes, context: bytes) -> bytes:
+    import _hashlib
+
+    libcrypto: Final = ctypes.CDLL(_hashlib.__file__)
+    kdf_fetch: Final = _kdf_fetch_function(libcrypto)
+    ctx_new: Final = _kdf_ctx_new_function(libcrypto)
+    derive: Final = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(_OsslParam)
+    )(("EVP_KDF_derive", libcrypto))
+    ctx_free: Final = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(("EVP_KDF_CTX_free", libcrypto))
+    kdf_free: Final = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(("EVP_KDF_free", libcrypto))
+    params: Final = (_OsslParam * 6)(
+        _param(b"mac", _OSSL_PARAM_UTF8_STRING, b"HMAC"),
+        _param(b"digest", _OSSL_PARAM_UTF8_STRING, b"SHA256"),
+        _param(b"key", _OSSL_PARAM_OCTET_STRING, key),
+        _param(b"salt", _OSSL_PARAM_OCTET_STRING, label),
+        _param(b"info", _OSSL_PARAM_OCTET_STRING, context),
+    )
+    derived: Final = ctypes.create_string_buffer(_DERIVED_KEY_BYTES)
+    kdf: Final = kdf_fetch(None, b"KBKDF", _FIPS_PROPERTIES)
+    ctx: Final = ctx_new(kdf)
+    try:
+        if not ctx or derive(ctx, derived, _DERIVED_KEY_BYTES, params) != 1:
+            raise ValueError("OpenSSL could not run KBKDF")
+        return derived.raw
+    finally:
+        ctx_free(ctx)
+        kdf_free(kdf)
+
+
+def derive_key_from_salt_key(label: bytes, context: bytes) -> str:
+    """Hex of 32 bytes derived from key_derivation_key(LITELLM_SALT_KEY) under label and context by SP 800-108r1 KBKDF
+    in counter mode with HMAC-SHA256, run by EVP_KDF from the FIPS provider of the OpenSSL that hashlib uses. Raises
+    ValueError when LITELLM_SALT_KEY is not set or is under 112 bits, or when no FIPS provider runs it."""
+    key: Final = key_derivation_key(os.getenv(SALT_KEY_ENV_VAR) or "")
+    if key is None:
+        raise ValueError(
+            f"With general_settings.fips_mode on, {SALT_KEY_ENV_VAR} must be set and {KEY_DERIVATION_KEY_RULE}, "
+            "such as sk-$(openssl rand -hex 32)"
+        )
+    return _kbkdf_hmac_sha256(key, label, context).hex()
+
+
+_FIPS_AT_REST_KEY_LABEL: Final = b"litellm-at-rest:aes-256-gcm:"
+_GCM_NONCE_BYTES: Final = 12
+_GCM_TAG_BYTES: Final = 16
+_AES_256_KEY_BYTES: Final = 32
+
+
+def _fips_at_rest_key(signing_key: str) -> bytes:
+    key: Final = key_derivation_key(signing_key)
+    if key is None:
+        raise ValueError(
+            f"With general_settings.fips_mode on, the salt key must be {KEY_DERIVATION_KEY_RULE}, such as "
+            "sk-$(openssl rand -hex 32)"
+        )
+    return _kbkdf_hmac_sha256(key, _FIPS_AT_REST_KEY_LABEL, b"")
+
+
+def _fips_seal_aes_gcm(key: bytes, plaintext: bytes) -> bytes | None:
+    """nonce(12) || ciphertext || tag(16) from the FIPS provider's AES-256-GCM, or None when OpenSSL cannot run it. No
+    nonce is passed in, so the provider draws it from its own DRBG, which FIPS 140-3 IG C.H requires and cryptography's
+    AESGCM cannot ask for. Raises ValueError when the key is not 32 bytes."""
+    if len(key) != _AES_256_KEY_BYTES:
+        raise ValueError(f"AES-256-GCM needs a {_AES_256_KEY_BYTES}-byte key, got {len(key)} bytes")
+    import _hashlib
+
+    libcrypto: Final = ctypes.CDLL(_hashlib.__file__)
+    int_p: Final = ctypes.POINTER(ctypes.c_int)
+    fetch: Final = _cipher_fetch_function(libcrypto)
+    ctx_new: Final = _cipher_ctx_new_function(libcrypto)
+    init: Final = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p
+    )(("EVP_EncryptInit_ex2", libcrypto))
+    update: Final = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, int_p, ctypes.c_char_p, ctypes.c_int
+    )(("EVP_EncryptUpdate", libcrypto))
+    final: Final = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, int_p)(
+        ("EVP_EncryptFinal_ex", libcrypto)
+    )
+    get_params: Final = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_OsslParam))(
+        ("EVP_CIPHER_CTX_get_params", libcrypto)
+    )
+    ctx_free: Final = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(("EVP_CIPHER_CTX_free", libcrypto))
+    cipher_free: Final = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(("EVP_CIPHER_free", libcrypto))
+    ciphertext: Final = ctypes.create_string_buffer(len(plaintext))
+    written: Final = ctypes.c_int()
+    nonce: Final = ctypes.create_string_buffer(_GCM_NONCE_BYTES)
+    tag: Final = ctypes.create_string_buffer(_GCM_TAG_BYTES)
+    nonce_and_tag: Final = (_OsslParam * 3)(
+        _OsslParam(b"iv", _OSSL_PARAM_OCTET_STRING, ctypes.addressof(nonce), _GCM_NONCE_BYTES, _OSSL_PARAM_UNMODIFIED),
+        _OsslParam(b"tag", _OSSL_PARAM_OCTET_STRING, ctypes.addressof(tag), _GCM_TAG_BYTES, _OSSL_PARAM_UNMODIFIED),
+    )
+    cipher: Final = fetch(None, b"AES-256-GCM", _FIPS_PROPERTIES)
+    ctx: Final = ctx_new()
+    try:
+        sealed: Final = (
+            bool(cipher)
+            and bool(ctx)
+            and init(ctx, cipher, key, None, None) == 1
+            and update(ctx, ciphertext, ctypes.byref(written), plaintext, len(plaintext)) == 1
+            and final(ctx, ciphertext, ctypes.byref(written)) == 1
+            and get_params(ctx, nonce_and_tag) == 1
+        )
+        return nonce.raw + ciphertext.raw + tag.raw if sealed else None
+    finally:
+        ctx_free(ctx)
+        cipher_free(cipher)
+
+
+def _get_encryption_algorithm() -> str:
+    """
+    Resolve the configured at-rest encryption algorithm for *new writes*.
+
+    Read from ``general_settings.encryption_algorithm`` at write time. Defaults to
+    the legacy XSalsa20-Poly1305 algorithm so deployments that have not opted in
+    keep producing byte-for-byte identical ciphertext.
+    """
+    if fips_mode_active():
+        return ALGO_AES_GCM
+    try:
+        from litellm.proxy.proxy_server import general_settings
+
+        algo: Final = general_settings.get(ENCRYPTION_ALGORITHM_SETTING, _ALGO_XSALSA20)
+    except Exception:
+        # general_settings may not be importable in some contexts (e.g. SDK-only
+        # use of these helpers). Fall back to the legacy algorithm.
+        return _ALGO_XSALSA20
+
+    if isinstance(algo, str) and algo.lower() == ALGO_AES_GCM:
+        return ALGO_AES_GCM
+    return _ALGO_XSALSA20
+
+
+def _derive_key(signing_key: str) -> bytes:
+    """Derive a 32-byte key from the salt/master key (shared by both algorithms).
+
+    Known limitation: this is a single-pass, unsalted ``SHA-256`` of the key, not
+    a dedicated KDF (HKDF/PBKDF2). It is the *same* derivation the legacy nacl
+    path already uses, so the AES path introduces no new weakness and stays
+    interoperable with existing key sourcing; AES-256-GCM's per-value 12-byte
+    random nonce gives the unique (key, nonce) pairs GCM requires. Moving both
+    algorithms to HKDF-SHA256 would be more defensible in an audit but is a
+    separate, coordinated change (it must re-derive or re-encrypt existing data).
+    """
+    import hashlib
+
+    return hashlib.sha256(signing_key.encode()).digest()
+
+
+def _seal_aes_gcm(value: str, signing_key: str, aad: bytes | None) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    nonce: Final = os.urandom(12)
+    # AESGCM.encrypt returns ciphertext || tag(16); wire format is nonce || that.
+    return nonce + AESGCM(_derive_key(signing_key)).encrypt(nonce, value.encode("utf-8"), aad)
+
+
+def _open_aes_gcm(sealed: bytes, signing_key: str, aad: bytes | None) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    # An empty plaintext still serializes to nonce(12) || tag(16) = 28 bytes, so a
+    # short/empty buffer here is a corrupt value: let AESGCM.decrypt raise and be
+    # swallowed by the caller (returns None/original), same as legacy.
+    return AESGCM(_derive_key(signing_key)).decrypt(sealed[:12], sealed[12:], aad).decode("utf-8")
+
+
+def _encrypt_aes_gcm(value: str, signing_key: str) -> str | None:
+    """Encrypt under AES-256-GCM and return the versioned ``v2:gcm:`` string. With general_settings.fips_mode on, the
+    key comes from the FIPS provider's KBKDF over the salt key and the nonce from the provider itself, and the result
+    is None when the provider cannot encrypt."""
+    sealed: Final = (
+        _fips_seal_aes_gcm(_fips_at_rest_key(signing_key), value.encode("utf-8"))
+        if fips_mode_active()
+        else _seal_aes_gcm(value=value, signing_key=signing_key, aad=None)
+    )
+    return None if sealed is None else V2_GCM_PREFIX + base64.urlsafe_b64encode(sealed).decode("utf-8")
+
+
+def _decrypt_aes_gcm(value: str, signing_key: str) -> str:
+    """Decrypt a versioned ``v2:gcm:`` string produced by :func:`_encrypt_aes_gcm`."""
+    sealed: Final = base64.urlsafe_b64decode(value[len(V2_GCM_PREFIX) :])
+    if fips_mode_active():
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key: Final = _fips_at_rest_key(signing_key)
+        return AESGCM(key).decrypt(sealed[:_GCM_NONCE_BYTES], sealed[_GCM_NONCE_BYTES:], None).decode("utf-8")
+    return _open_aes_gcm(sealed=sealed, signing_key=signing_key, aad=None)
+
+
+def encrypt_bearer_token(value: str, prefix: str) -> str:
+    """AES-256-GCM as unpadded base64url behind ``prefix``, which is also the AAD so a token can't change kind."""
+    salt_key: Final = get_salt_key()
+    if not isinstance(salt_key, str):
+        raise ValueError("Set LITELLM_SALT_KEY or a master key to mint bearer tokens")
+    sealed: Final = _seal_aes_gcm(value=value, signing_key=salt_key, aad=prefix.encode("utf-8"))
+    return prefix + base64.urlsafe_b64encode(sealed).decode("ascii").rstrip("=")
+
+
+def decrypt_bearer_token(token: str, prefix: str) -> str | None:
+    """None unless ``token`` came from :func:`encrypt_bearer_token` with the same ``prefix``."""
+    salt_key: Final = get_salt_key()
+    if not isinstance(salt_key, str) or not token.startswith(prefix):
+        return None
+    encoded: Final = token.removeprefix(prefix)
+    try:
+        sealed: Final = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        return _open_aes_gcm(sealed=sealed, signing_key=salt_key, aad=prefix.encode("utf-8"))
+    except Exception:  # noqa: BLE001  # base64 and AES-GCM each raise their own "not a token" type
+        return None
+
+
+_Passthrough = TypeVar("_Passthrough")
+
+
+@overload
+def encrypt_value_helper(value: str, new_encryption_key: str | None = None) -> str: ...
+
+
+@overload
+def encrypt_value_helper(value: _Passthrough, new_encryption_key: str | None = None) -> _Passthrough: ...
+
+
+def encrypt_value_helper(value: object, new_encryption_key: str | None = None) -> object:
+    signing_key: Final = new_encryption_key or get_salt_key()
+
+    try:
+        if isinstance(value, str):
+            if _get_encryption_algorithm() == ALGO_AES_GCM:
+                # AES path: the v2:gcm: output is already a base64url string, so it
+                # is returned directly with no extra base64 wrapper.
+                encrypted: Final = _encrypt_aes_gcm(value=value, signing_key=cast(str, signing_key))
+                if encrypted is None:
+                    raise ValueError("OpenSSL could not run AES-256-GCM")
+                return encrypted
+
+            encrypted_value = encrypt_value(value=value, signing_key=signing_key)
+            # Use urlsafe_b64encode for URL-safe base64 encoding (replaces + with - and / with _)
+            encrypted_value = base64.urlsafe_b64encode(encrypted_value).decode("utf-8")
+
+            return encrypted_value
+
+        verbose_proxy_logger.debug(
+            "Invalid value type passed to encrypt_value: %s for Value: %s\n Value must be a string", type(value), value
+        )
+        # if it's not a string - do not encrypt it and return the value
+        return value
+    except Exception as e:
+        raise e
+
+
+def _legacy_ciphertext_bytes(value: str) -> bytes:
+    # Try URL-safe base64 decoding first (new format)
+    # Fall back to standard base64 decoding for backwards compatibility (old format)
+    try:
+        return base64.urlsafe_b64decode(value)
+    except Exception:
+        return base64.b64decode(value)
+
+
+def _unreadable_in_fips_mode(value: str) -> bool:
+    """With general_settings.fips_mode on, only v2:gcm: values are decrypted."""
+    return fips_mode_active() and not value.startswith(V2_GCM_PREFIX)
+
+
+def _decrypt_with_signing_key(value: str, signing_key: str) -> str:
+    # Versioned AES-256-GCM values are detected before any base64 decode.
+    # The prefix is the algorithm tag the legacy nacl format never carried.
+    if value.startswith(V2_GCM_PREFIX):
+        return _decrypt_aes_gcm(value=value, signing_key=signing_key)
+
+    return decrypt_value(value=_legacy_ciphertext_bytes(value), signing_key=signing_key)
+
+
+def decrypt_if_encrypted_with(value: str, signing_key: str) -> str | None:
+    """None unless value is a ciphertext under signing_key."""
+    if _unreadable_in_fips_mode(value):
+        return None
+    try:
+        # base64 decoding skips characters outside its alphabet, so "" and "*" decode to no bytes,
+        # which decrypt_value reads as an empty plaintext under any key.
+        decodes_to_nothing: Final = not value.startswith(V2_GCM_PREFIX) and not _legacy_ciphertext_bytes(value)
+        return None if decodes_to_nothing else _decrypt_with_signing_key(value=value, signing_key=signing_key)
+    except Exception:  # noqa: BLE001  # base64, nacl and AES-GCM each raise their own "not a ciphertext" type
+        return None
+
+
+def decrypt_value_helper(
+    value: str,
+    key: str,  # this is just for debug purposes, showing the k,v pair that's invalid. not a signing key.
+    exception_type: Literal["debug", "error"] = "error",
+    return_original_value: bool = False,
+) -> str | None:
+    signing_key: Final = get_salt_key()
+
+    try:
+        if isinstance(value, str):
+            if _unreadable_in_fips_mode(value):
+                raise ValueError("With general_settings.fips_mode on, only v2:gcm: values can be decrypted")
+            return _decrypt_with_signing_key(value=value, signing_key=cast(str, signing_key))
+
+        # if it's not str - do not decrypt it, return the value
+        return value
+    except Exception as e:
+        error_message = f"Error decrypting value for key: {key}, Did your master_key/salt key change recently? \nError: {e}\nSet permanent salt key - https://docs.litellm.ai/docs/proxy/prod#5-set-litellm-salt-key"
+        if exception_type == "debug":
+            verbose_proxy_logger.debug(error_message)
+            return value if return_original_value else None
+
+        verbose_proxy_logger.debug("Unable to decrypt value for key: %s, returning None", key)
+        if return_original_value:
+            return value
+        else:
+            verbose_proxy_logger.exception(error_message)
+            # [Non-Blocking Exception. - this should not block decrypting other values]
+            return None
+
+
+def encrypt_value(value: str, signing_key: str):
+    import hashlib
+
+    import nacl.secret
+    import nacl.utils
+
+    # get 32 byte master key #
+    hash_object: Final = hashlib.sha256(signing_key.encode())
+    hash_bytes: Final = hash_object.digest()
+
+    # initialize secret box #
+    box: Final = nacl.secret.SecretBox(hash_bytes)
+
+    # encode message #
+    value_bytes: Final = value.encode("utf-8")
+
+    encrypted: Final = box.encrypt(value_bytes)
+
+    return encrypted
+
+
+def decrypt_value(value: bytes, signing_key: str) -> str:
+    import hashlib
+
+    import nacl.secret
+    import nacl.utils
+
+    # get 32 byte master key #
+    hash_object: Final = hashlib.sha256(signing_key.encode())
+    hash_bytes: Final = hash_object.digest()
+
+    # initialize secret box #
+    box: Final = nacl.secret.SecretBox(hash_bytes)
+
+    # Convert the bytes object to a string
+    try:
+        if len(value) == 0:
+            return ""
+
+        plaintext = box.decrypt(value)
+        plaintext = plaintext.decode("utf-8")
+        return plaintext
+    except Exception as e:
+        raise e
+
+
+class SecretMapDecodeError(RuntimeError):
+    pass
+
+
+_SECRET_MAP: Final = TypeAdapter(Mapping[str, str])
+_STORED_SECRET_MAP: Final = TypeAdapter(Mapping[str, str] | str)
+_SECRET_STRING: Final = TypeAdapter(str)
+
+
+def decode_legacy_mcp_user_credential(stored: str) -> str | None:
+    try:
+        return base64.urlsafe_b64decode(stored).decode()
+    except (binascii.Error, UnicodeDecodeError, ValueError, TypeError):
+        return None
+
+
+def encrypt_secret_map(value: Mapping[str, str], new_encryption_key: str | None = None) -> str:
+    if not value:
+        return "{}"
+    ciphertext: Final = _SECRET_STRING.validate_python(
+        encrypt_value_helper(_SECRET_MAP.dump_json(value).decode(), new_encryption_key=new_encryption_key), strict=True
+    )
+    return _SECRET_STRING.dump_json(ciphertext).decode()
+
+
+def decode_secret_map(value: object, *, key: str) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    try:
+        stored: Final = (
+            _STORED_SECRET_MAP.validate_json(value, strict=True)
+            if isinstance(value, str) and value.lstrip().startswith(("{", '"'))
+            else _STORED_SECRET_MAP.validate_python(value, strict=True)
+        )
+        if not isinstance(stored, str):
+            return stored
+        decrypted: Final = decrypt_value_helper(
+            value=stored, key=key, exception_type="debug", return_original_value=False
+        )
+        return _SECRET_MAP.validate_json(decrypted, strict=True)
+    except ValidationError:
+        raise SecretMapDecodeError(f"Cannot decode encrypted MCP {key}; check LITELLM_SALT_KEY") from None

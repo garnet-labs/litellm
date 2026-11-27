@@ -1,0 +1,207 @@
+import ast
+import os
+from itertools import filterfalse
+from typing import Final
+
+NON_SDK_SOURCE_DIRS: Final = frozenset(
+    {"cli", "deploy", "enterprise", "packaging", "proxy-extras", "runtime", "rust", "scripts", "ui", "vscode-extension"}
+)
+
+IGNORE_FUNCTIONS = [
+    "_with_original_numbers",  # DEFAULT_MAX_RECURSE_DEPTH bound, deeper values keep the guardrail's decoded JSON.
+    "with_sanitized_schema_at",  # depth is len(path), a literal tuple of at most two keys at every call site.
+    "check_opaque_inference_controls",  # DEFAULT_MAX_RECURSE_DEPTH bound, rejects unchecked nesting with HTTP 403.
+    "_json_cost",  # bounded at depth 32 and consumed under byte/node limits.
+    "_ids_to_walk",  # cache key walker, bounded at _REPR_WALK_MAX_DEPTH (32) with a cycle guard.
+    "_level_holds_large_str",  # cache key walker, bounded at _REPR_WALK_MAX_DEPTH (32) with a cycle guard.
+    "_compact_actor_value",
+    "detached",  # router_config: copies only the plain containers of the router's own constructor arguments, once per build or changeset
+    "_format_type",
+    "_count_anthropic_content",  # Nested server result mappings are bounded by DEFAULT_MAX_RECURSE_DEPTH.
+    "remove_additional_properties",
+    "remove_strict_from_schema",
+    "filter_schema_fields",
+    "text_completion",
+    "_check_for_os_environ_vars",
+    "clean_message",
+    "unpack_defs",
+    "convert_anyof_null_to_nullable",  # has a set max depth
+    "add_object_type",
+    "strip_field",
+    "transform_prompt",
+    "mask_dict",
+    "_serialize",  # we now set a max depth for this
+    "_sanitize_request_body_for_spend_logs_payload",  # testing added for circular reference
+    "_sanitize_value",  # testing added for circular reference
+    "set_schema_property_ordering",  # testing added for infinite recursion
+    "process_items",  # testing added for infinite recursion + max depth set.
+    "_can_object_call_model",  # max depth set.
+    "encode_unserializable_types",  # max depth set.
+    "filter_value_from_dict",  # max depth set.
+    "normalize_json_schema_types",  # max depth set.
+    "_extract_fields_recursive",  # max depth set.
+    "_node_blocks",  # bedrock tool call arguments, bounded by MAX_STRUCTURED_CONTENT_SCAN_DEPTH.
+    "_json_text_with_masks",  # walks a tree _node_blocks already admitted within the depth bound.
+    "_value_with_masks",  # walks a tree _node_blocks already admitted within the depth bound.
+    "remove_json_schema_refs",  # max depth set.,
+    "_convert_schema_types",  # max depth set.,
+    "_fix_enum_empty_strings",  # max depth set.,
+    "get_access_token",  # max depth set.,
+    "_redact_base64",  # max depth set.
+    "_contains_vision_content",  # max depth set.
+    "_read_all_bytes",  # max depth set.
+    "_fix_enum_types",  # max depth set.
+    "_pin_scalar_consts",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); leaves the subtree past the cap untouched.
+    "_collect_argument_paths",  # max depth set.
+    "_split_text",  # max depth set.
+    "_mask_sequence",  # max depth set.
+    "_encrypted_param",  # max depth set.
+    "_decrypted_param",  # max depth set.
+    "contains_encrypted_marker",  # max depth set.
+    "_rotate_guardrail_row",  # bounded by attempts_left.
+    "_responses_dropping_refused_fields",  # bounded by _REFUSED_FIELDS, each retry drops a field it sent.
+    "_delete_nested_value_custom",  # max depth set (bounded by number of path segments).
+    "_filter_exceptions_from_params",  # max depth set (default 20) to prevent infinite recursion.
+    "__getattr__",  # lazy loading pattern in litellm/__init__.py with proper caching to prevent infinite recursion.
+    "_validate_inheritance_chain",  # max depth set (default 100) to prevent infinite recursion in policy inheritance validation.
+    "_basic_json_schema_validate",  # max depth set.
+    "extract_text_from_a2a_message",  # max depth set (default 10) to prevent infinite recursion in A2A message parsing.
+    "_request_body",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH) and circular reference protection to prevent infinite recursion.
+    "_convert_to_json_serializable_dict",  # max depth set (default 20) and circular reference protection to prevent infinite recursion.
+    "dict",  # max depth set. _LiteLLMParamsDictView.dict() calls builtin dict(), not itself.
+    "_read_image_bytes",  # max depth set.
+    "get_masked_values",  # max depth set (default 20) to prevent infinite recursion while masking nested sensitive config dicts.
+    "_redact_sensitive_litellm_params",  # max depth set (default 10).
+    "_redact_secret_values_in_obj",  # max depth set (default 10, _REDACT_SECRET_MAX_DEPTH); fails closed by returning "REDACTED" at the cap.
+    "_resolve",  # OCI: $ref resolver bounded by `resolving_stack` cycle guard.
+    "resolve_oci_schema_anyof",  # OCI: bounded by JSON-schema tree depth (no cycles possible in well-formed input).
+    "sanitize_oci_schema",  # OCI: bounded by JSON-schema tree depth.
+    "_opensearch_filter",  # OpenSearch: runs only on a filter pydantic validated, whose recursion guard stops at depth 255.
+    "_exact_filter",  # OpenSearch: runs only on a filter pydantic validated, whose recursion guard stops at depth 255.
+    "_freeze_for_dedupe",  # OTEL: max depth set (default 16, _FREEZE_MAX_DEPTH); fails closed by returning repr(value) at the cap.
+    "apply_json_merge_patch",  # max depth set (_MAX_MERGE_DEPTH=64); fails closed by raising ValueError at the cap.
+    "_inlined",  # max depth set (_MAX_INLINE_DEPTH=32); passes the schema node through untouched at the cap. Walks a Pydantic JSON schema once at import time.
+    "_filter_argument_value",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by blocking the tool call at the cap.
+    "_redact_scanned_content",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by returning "[REDACTED]" at the cap.
+    "replace_ciphertexts",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); walks stored JSON, which has no cycles, and leaves values below the cap untouched.
+    "_iter_fallback_targets",  # max depth set (2 * ROUTER_MAX_FALLBACKS); fails closed by raising ValueError at the cap.
+    "_mergeable_branch",  # max depth set (_MAX_SCHEMA_FLATTEN_DEPTH=32) plus a seen_refs cycle guard; passes the schema through untouched at the cap.
+    "json_string_leaves",  # max depth set (MAX_STRUCTURED_CONTENT_SCAN_DEPTH); fails closed by raising at the cap so nothing goes unscanned.
+    "strict_json_schema",  # harness: max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by raising ValueError at the cap.
+    "toml_value",  # harness/codex: max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by raising OptionsMismatch at the cap.
+    "with_json_string_leaves",  # transitively bounded: only runs on a tree json_string_leaves already walked under the cap.
+    "_clean_extraction",  # ScaleDown: traverses the entity map built under MAX_SCHEMA_DEPTH=32 and MAX_ENTITIES=1000.
+    "json_unrewritable_labels",  # max depth set (MAX_STRUCTURED_CONTENT_SCAN_DEPTH); returns the None sentinel at the cap so the caller blocks.
+    "_flatten_form_field",  # bounded by the nesting depth of the already-parsed request body (a finite JSON tree, no cycles possible).
+    "_flatten_form_data_field",  # bounded by the nesting depth of the already-parsed request body (a finite JSON tree, no cycles possible).
+    "_json_safe",  # max depth set (_MAX_DEPTH) plus a seen-ids cycle guard for self-referential input.
+    "_redact_agent_params_tree",  # max depth set (default 10), same shape as _redact_sensitive_litellm_params.
+    "_restore_redacted_nested_value",  # max depth set (default 10), mirrors _redact_agent_params_tree on the write side.
+    "_unqualified",  # bounded by the qualifier depth of a static TypedDict annotation (Annotated, Required/NotRequired, ReadOnly around one type, no cycles possible).
+    "_render_json",  # bounded by the nesting depth of a pydantic-validated JsonValue from the operator's config (a finite JSON tree, no cycles possible).
+    "with_id_fields_replaced",  # harness/opencode: bounded by the nesting depth of the JsonValue that validate_json parsed from `opencode export`, which refuses nesting past ~200 levels.
+    "completion_cost",  # max depth 1: recursion only fires for mixed-tier Responses WS logging objects, and each split part carries a single service_tier so _split_responses_ws_logging_object_by_service_tier returns None.
+    "_string_leaves",  # bounded by the nesting depth of a safe_json_structure output (a finite JSON tree, no cycles possible).
+    "_compact_actor_value",  # OCSF actors have schema-bounded depth.
+    "_replace_string_leaves",  # bounded by the nesting depth of a safe_json_structure output (a finite JSON tree, no cycles possible).
+    "_redacted_client_field",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by returning REDACTED for anything nested past the cap.
+    "_sort_processed_sets",  # bounded by the nesting depth of the log-record extra it walks (a finite JSON tree, no cycles possible).
+    "scrub_json_strings",  # max depth set (MAX_SCRUB_DEPTH); fails closed by returning "[Filtered]" for anything nested past the cap.
+    "_without_requester_ip_address",  # walks only the fresh tree _sanitize_request_body_for_spend_logs_payload returns (mapping cycles already cut), so it never goes deeper than that sanitizer did.
+    "_merge_session_fields",  # max depth set (_SESSION_MERGE_MAX_DEPTH); deeper mappings are replaced wholesale by the later session.update.
+    "_json",  # router_rust index views: max depth set (DEFAULT_MAX_RECURSE_DEPTH); fails closed by raising ValueError at the cap.
+    "to_wire",  # router_rust model info: bounded by the nesting depth of a stored deployment or cost-map entry (finite JSON trees: pydantic refuses a cycle when it dumps a deployment).
+    "from_wire",  # router_rust model info: walks only what router-core merged from to_wire's output, so it never goes deeper than to_wire did.
+    "_aws_group_members",  # bedrock vector store filters: walks only a pydantic-validated filter, which pydantic-core stops at 255 levels of nesting.
+    "_valid_frontmatter_node",  # max depth 32, manifest size capped at 1 MiB, and YAML aliases rejected before traversal.
+    "_gemini_wire_value",  # max depth set (DEFAULT_MAX_RECURSE_DEPTH); returns the subtree as plain JSON at the cap.
+    "_cause_chain",  # openai common_utils: max depth set (_LONGEST_CAUSE_CHAIN links of __cause__ / __context__).
+    "_context_chain",  # router_rust core: max depth set (_LONGEST_CONTEXT_CHAIN links of __context__).
+    "_schema_rejection",  # cohere v2 response_format schema check: max depth set (_SCHEMA_DEPTH_CHECKED); returns a rejection at the cap.
+    "_without_token_data",  # guardrail fingerprint: max depth set (DEFAULT_MAX_RECURSE_DEPTH); hashes the subtree as is at the cap.
+]
+
+
+class RecursiveFunctionFinder(ast.NodeVisitor):
+    def __init__(self):
+        self.recursive_functions = []
+        self.ignored_recursive_functions = []
+
+    def visit_FunctionDef(self, node):
+        # Check if the function calls itself
+        if any(self._is_recursive_call(node, call) for call in ast.walk(node)):
+            if node.name in IGNORE_FUNCTIONS:
+                self.ignored_recursive_functions.append(node.name)
+            else:
+                self.recursive_functions.append(node.name)
+        self.generic_visit(node)
+
+    def _is_recursive_call(self, func_node, call_node):
+        # Check if the call node is a function call
+        if not isinstance(call_node, ast.Call):
+            return False
+
+        # Case 1: Direct function call (e.g., my_func())
+        if isinstance(call_node.func, ast.Name) and call_node.func.id == func_node.name:
+            return True
+
+        # Case 2: Method call with self (e.g., self.my_func())
+        if isinstance(call_node.func, ast.Attribute) and isinstance(
+            call_node.func.value, ast.Name
+        ):
+            return (
+                call_node.func.value.id == "self"
+                and call_node.func.attr == func_node.name
+            )
+
+        return False
+
+
+def find_recursive_functions_in_file(file_path):
+    with open(file_path, "r") as file:
+        tree = ast.parse(file.read(), filename=file_path)
+    finder = RecursiveFunctionFinder()
+    finder.visit(tree)
+    return finder.recursive_functions, finder.ignored_recursive_functions
+
+
+def find_recursive_functions_in_directory(directory):
+    recursive_functions = {}
+    ignored_recursive_functions = {}
+    for root, dirs, files in os.walk(directory):
+        if os.path.normpath(root) == os.path.normpath(directory):
+            dirs[:] = filterfalse(NON_SDK_SOURCE_DIRS.__contains__, dirs)
+        for file in files:
+            print("file: ", file)
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+                functions, ignored = find_recursive_functions_in_file(file_path)
+                if functions:
+                    recursive_functions[file_path] = functions
+                if ignored:
+                    ignored_recursive_functions[file_path] = ignored
+    return recursive_functions, ignored_recursive_functions
+
+
+if __name__ == "__main__":
+    # Example usage
+    # raise exception if any recursive functions are found, except for the ignored ones
+    # this is used in the CI/CD pipeline to prevent recursive functions from being merged
+
+    directory_path = "./litellm"
+    recursive_functions, ignored_recursive_functions = (
+        find_recursive_functions_in_directory(directory_path)
+    )
+    print("UNIGNORED RECURSIVE FUNCTIONS: ", recursive_functions)
+    print("IGNORED RECURSIVE FUNCTIONS: ", ignored_recursive_functions)
+
+    if len(recursive_functions) > 0:
+        # raise exception if any recursive functions are found
+        for file, functions in recursive_functions.items():
+            print(
+                f"🚨 Unignored recursive functions found in {file}: {functions}. THIS IS REALLY BAD, it has caused CPU Usage spikes in the past. Only keep this if it's ABSOLUTELY necessary."
+            )
+        file, functions = list(recursive_functions.items())[0]
+        raise Exception(
+            f"🚨 Unignored recursive functions found include {file}: {functions}. THIS IS REALLY BAD, it has caused CPU Usage spikes in the past. Only keep this if it's ABSOLUTELY necessary."
+        )
