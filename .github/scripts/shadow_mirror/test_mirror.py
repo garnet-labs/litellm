@@ -3,8 +3,10 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, call, patch
+from urllib.parse import parse_qs, urlsplit
 
 from mirror import (
     API,
@@ -12,6 +14,7 @@ from mirror import (
     HOLD,
     HOLD_MARKER,
     SOURCE,
+    UTC,
     WORKFLOW,
     APIError,
     Mirror,
@@ -113,6 +116,44 @@ class DiscoveryTest(unittest.TestCase):
         for api, repo in ((API("unused", False), SOURCE), (API("unused", True), FORK)):
             with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
                 api.call(repo, "pulls", "POST", {})
+
+    def test_recent_merged_search_pages_dependency_bots(self):
+        api = API("unused", True)
+        api._request = Mock(
+            side_effect=[
+                {
+                    "total_count": 101,
+                    "incomplete_results": False,
+                    "items": [{"number": number} for number in range(1, 101)],
+                },
+                {
+                    "total_count": 101,
+                    "incomplete_results": False,
+                    "items": [{"number": 101}],
+                },
+            ]
+        )
+        cutoff = datetime(2026, 11, 13, tzinfo=UTC)
+        self.assertEqual(
+            list(api.merged_dependency_candidates(cutoff)), list(range(1, 102))
+        )
+        for page, request in enumerate(api._request.call_args_list, 1):
+            path, method, body = request.args
+            url = urlsplit(path)
+            self.assertEqual((url.path, method, body), ("search/issues", "GET", None))
+            self.assertEqual(
+                parse_qs(url.query),
+                {
+                    "q": [
+                        (
+                            "repo:BerriAI/litellm is:pr is:merged merged:>=2026-11-13 "
+                            "author:app/dependabot author:app/renovate"
+                        )
+                    ],
+                    "per_page": ["100"],
+                    "page": [str(page)],
+                },
+            )
 
     def test_scrub_title_removes_upstream_references(self):
         self.assertEqual(
@@ -313,6 +354,70 @@ class ReplayTest(unittest.TestCase):
             [(r["pr"], r["status"]) for r in results], [(1, "skipped"), (2, "dry-run")]
         )
         self.assertEqual(results[0]["reason"], "upstream PR not found")
+        self.api.write.assert_not_called()
+
+    def test_recent_merge_replays_original_head_against_the_same_compare_base(self):
+        self.mirror.merge_cutoff = datetime(2026, 11, 13, 12, tzinfo=UTC)
+        self.pr.update(
+            state="closed",
+            merged_at="2026-11-13T12:00:00Z",
+            user={"login": "dependabot[bot]", "type": "Bot"},
+        )
+        self.api.call.side_effect = [
+            self.pr,
+            self.pr,
+            {"merge_base_commit": {"sha": self.merge_base}},
+        ]
+        self.api.pages.return_value = self.files
+        with patch.object(self.mirror, "replay") as replay:
+            self.assertEqual(self.mirror.sync(52102), replay.return_value)
+        replay.assert_called_once_with(52102, self.pr, self.files, self.merge_base, {})
+        self.api.call.assert_has_calls(
+            [
+                call(SOURCE, "pulls/52102"),
+                call(SOURCE, "pulls/52102"),
+                call(SOURCE, f"compare/{self.source_base}...{self.source_head}"),
+            ]
+        )
+
+    def test_closed_non_bot_unmerged_or_expired_sources_are_not_replayed(self):
+        self.mirror.merge_cutoff = datetime(2026, 11, 13, 12, tzinfo=UTC)
+        bot = {"login": "dependabot[bot]", "type": "Bot"}
+        for merged_at, author in (
+            (None, bot),
+            ("2026-11-13T11:59:59Z", bot),
+            ("2026-11-14T00:00:00Z", self.pr["user"]),
+        ):
+            with self.subTest(merged_at=merged_at, author=author):
+                self.api.call.return_value = {
+                    **self.pr,
+                    "state": "closed",
+                    "merged_at": merged_at,
+                    "user": author,
+                }
+                self.assertEqual(
+                    self.mirror.sync(1),
+                    {"status": "skipped", "reason": "source closed"},
+                )
+        self.api.pages.assert_not_called()
+        self.api.write.assert_not_called()
+
+    def test_recent_merged_bot_still_needs_a_recorded_dependency_file(self):
+        self.mirror.merge_cutoff = datetime(2026, 11, 13, 12, tzinfo=UTC)
+        self.api.call.return_value = {
+            **self.pr,
+            "state": "closed",
+            "merged_at": "2026-11-14T00:00:00Z",
+            "user": {"login": "renovate[bot]", "type": "Bot"},
+        }
+        self.api.pages.return_value = [{"filename": "litellm/rust/Cargo.lock"}]
+        self.assertEqual(
+            self.mirror.sync(1),
+            {
+                "status": "skipped",
+                "reason": "not an eligible recorded dependency change",
+            },
+        )
         self.api.write.assert_not_called()
 
     def test_replaced_tree_has_only_the_recorder_in_workflows(self):
