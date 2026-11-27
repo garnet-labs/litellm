@@ -42,13 +42,14 @@ jobs:
         shell: bash
         env:
           SHADOW_MIRROR_TOKEN: ${{ secrets.SHADOW_MIRROR_TOKEN }}
+          GH_TOKEN: ${{ inputs.dry_run && github.token || '' }}
           PRS: ${{ inputs.prs }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          if [[ -z "$SHADOW_MIRROR_TOKEN" ]]; then
-            echo '::notice::SHADOW_MIRROR_TOKEN is not configured; skipping sync.'
-            exit 0
+          if [[ "$DRY_RUN" != true && -z "$SHADOW_MIRROR_TOKEN" ]]; then
+            echo '::error::Set SHADOW_MIRROR_TOKEN to a PAT with write access to Contents, Pull requests, Actions, and Workflows.'
+            exit 1
           fi
           args=()
           if [[ "$DRY_RUN" == true ]]; then
