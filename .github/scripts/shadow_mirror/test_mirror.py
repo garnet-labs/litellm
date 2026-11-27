@@ -21,6 +21,7 @@ from mirror import (
     is_dependency_pr,
     main,
     mirror_revision,
+    publish_verdict,
     recording_workflow,
     scrub_title,
 )
@@ -532,6 +533,130 @@ class ReplayTest(unittest.TestCase):
                     ]
                     self.mirror.ensure_gate_comment(3)
                     self.api.write.assert_not_called()
+
+
+class VerdictTest(unittest.TestCase):
+    head = "a" * 40
+
+    def setUp(self):
+        self.api = Mock(spec=API)
+        self.pr = {
+            "state": "open",
+            "base": {"ref": "shadow/base/18-r2", "repo": {"full_name": FORK}},
+            "head": {
+                "ref": "shadow/pr/18-r2",
+                "repo": {"full_name": FORK},
+                "sha": self.head,
+            },
+        }
+        self.api.call.return_value = self.pr
+        self.api.viewer_login.return_value = "mirror-owner"
+        self.api.pages.return_value = []
+        self.legacy = {
+            "id": 42,
+            "body": HOLD,
+            "user": {"login": "mirror-owner"},
+        }
+
+    def publish(self):
+        publish_verdict(
+            self.api, 173, self.head, "PASS", "Nothing new.\n\n[App](url)", "b" * 32
+        )
+
+    def test_migrates_the_owned_legacy_comment_in_place_and_is_idempotent(self):
+        self.api.pages.return_value = [{"body": ""}, self.legacy]
+        self.publish()
+        path, data, method = self.api.write.call_args.args
+        self.assertEqual((path, method), ("issues/comments/42", "PATCH"))
+        self.assertEqual(
+            data["body"],
+            f"{GATE_MARKER}\nHead: `{self.head}`\n\n**PASS** · Nothing new."
+            "\n\n[App](url)\n\nNot PR approval; merging policy still applies."
+            f"\n\n[Written by Devin](https://app.devin.ai/sessions/{'b' * 32})",
+        )
+        self.assertEqual(self.api.call.call_args_list, [call(FORK, "pulls/173")] * 2)
+        self.api.pages.assert_called_once_with(FORK, "issues/173/comments")
+        self.api.write.reset_mock()
+        self.api.pages.return_value = [{**self.legacy, "body": data["body"]}]
+        self.publish()
+        self.api.write.assert_not_called()
+
+    def test_creates_only_when_no_marker_exists(self):
+        self.api.pages.return_value = [{"body": "Unrelated"}]
+        self.publish()
+        path, data = self.api.write.call_args.args
+        self.assertEqual(path, "issues/173/comments")
+        self.assertTrue(data["body"].startswith(GATE_MARKER))
+
+    def test_rejects_foreign_or_duplicate_comments(self):
+        for comments in (
+            [{**self.legacy, "user": {"login": "someone-else"}}],
+            [self.legacy, {**self.legacy, "id": 43, "body": GATE_MARKER}],
+        ):
+            with self.subTest(comments=comments):
+                self.api.pages.return_value = comments
+                with self.assertRaises(ValueError):
+                    self.publish()
+                self.api.write.assert_not_called()
+
+    def test_rejects_non_mirror_closed_and_stale_pulls(self):
+        for pr in (
+            {**self.pr, "state": "closed"},
+            {**self.pr, "base": {**self.pr["base"], "ref": "main"}},
+            {**self.pr, "head": {**self.pr["head"], "repo": {"full_name": SOURCE}}},
+            {**self.pr, "head": {**self.pr["head"], "sha": "b" * 40}},
+        ):
+            with self.subTest(pr=pr):
+                self.api.call.return_value = pr
+                with self.assertRaises(ValueError):
+                    self.publish()
+                self.api.pages.assert_not_called()
+                self.api.write.assert_not_called()
+
+    def test_rechecks_head_before_writing(self):
+        self.api.pages.return_value = [self.legacy]
+        self.api.call.side_effect = [
+            self.pr,
+            {**self.pr, "head": {**self.pr["head"], "sha": "b" * 40}},
+        ]
+        with self.assertRaisesRegex(ValueError, "PR head changed"):
+            self.publish()
+        self.api.write.assert_not_called()
+
+    def test_rejects_invalid_input_without_api_calls(self):
+        for number, head, verdict, reason in (
+            (0, self.head, "PASS", "reason"),
+            ("173", self.head, "PASS", "reason"),
+            (173, "a" * 7, "PASS", "reason"),
+            (173, self.head, "APPROVE", "reason"),
+            (173, self.head, "HOLD", " "),
+            (173, self.head, "HOLD", GATE_MARKER),
+            (173, self.head, "HOLD", "é" * 8192),
+        ):
+            with self.subTest(number=number, head=head, verdict=verdict):
+                with self.assertRaises(ValueError):
+                    publish_verdict(self.api, number, head, verdict, reason)
+                self.api.assert_not_called()
+                self.assertEqual(self.api.mock_calls, [])
+
+    def test_verdict_command_requires_mirror_secret_not_gh_token(self):
+        argv = [
+            "mirror.py",
+            "verdict",
+            "--pr=173",
+            f"--head={self.head}",
+            "--verdict=HOLD",
+            "--body=Awaiting evidence",
+        ]
+        with (
+            patch("mirror.sys.argv", argv),
+            patch.dict("mirror.os.environ", {"GH_TOKEN": "unused"}, clear=True),
+            patch("mirror.publish_verdict") as publish,
+            patch("mirror.sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit),
+        ):
+            main()
+        publish.assert_not_called()
 
 
 if __name__ == "__main__":

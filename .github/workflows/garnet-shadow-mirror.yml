@@ -15,6 +15,21 @@ on:
         description: List eligible changes without writing to GitHub
         type: boolean
         default: false
+      verdict_pr:
+        description: Mirror PR number to publish a verdict on (leave blank to sync)
+        type: string
+      verdict:
+        description: PASS or HOLD, as derived from Garnet pr_review
+        type: string
+      verdict_head:
+        description: Full mirror head SHA evaluated by Garnet pr_review
+        type: string
+      verdict_body:
+        description: Reason, changed rows if applicable, and App record link
+        type: string
+      verdict_session:
+        description: Optional Devin session ID for attribution
+        type: string
 
 permissions:
   contents: read
@@ -38,15 +53,34 @@ jobs:
           persist-credentials: false
       - name: Test shadow mirror
         run: python3 -m unittest discover -s .github/scripts/shadow_mirror
-      - name: Sync dependency changes
+      - name: Sync dependency changes or publish a gate verdict
         shell: bash
         env:
           SHADOW_MIRROR_TOKEN: ${{ secrets.SHADOW_MIRROR_TOKEN }}
           GH_TOKEN: ${{ inputs.dry_run && github.token || '' }}
           PRS: ${{ inputs.prs }}
           DRY_RUN: ${{ inputs.dry_run }}
+          VERDICT_PR: ${{ inputs.verdict_pr }}
+          VERDICT: ${{ inputs.verdict }}
+          VERDICT_HEAD: ${{ inputs.verdict_head }}
+          VERDICT_BODY: ${{ inputs.verdict_body }}
+          VERDICT_SESSION: ${{ inputs.verdict_session }}
         run: |
           set -euo pipefail
+          if [[ -n "${VERDICT_PR}${VERDICT}${VERDICT_HEAD}${VERDICT_BODY}${VERDICT_SESSION}" ]]; then
+            if [[ "$DRY_RUN" == true || -n "$PRS" ]]; then
+              echo '::error::Verdict mode cannot be combined with sync inputs.'
+              exit 1
+            fi
+            if [[ ! "$VERDICT_PR" =~ ^[1-9][0-9]*$ ]]; then
+              echo '::error::Verdict mode requires a positive integer mirror PR number.'
+              exit 1
+            fi
+            python3 .github/scripts/shadow_mirror/mirror.py verdict \
+              --pr="$VERDICT_PR" --head="$VERDICT_HEAD" --verdict="$VERDICT" \
+              --body="$VERDICT_BODY" --session="$VERDICT_SESSION"
+            exit 0
+          fi
           if [[ "$DRY_RUN" != true && -z "$SHADOW_MIRROR_TOKEN" ]]; then
             echo '::error::Set SHADOW_MIRROR_TOKEN to a PAT with write access to Contents, Pull requests, Actions, and Workflows.'
             exit 1

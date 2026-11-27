@@ -21,7 +21,9 @@ MARKER = re.compile(
 )
 HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
 GATE_MARKER = "<!-- garnet-merge-gate -->"
+GATE_MARKERS = (HOLD_MARKER, GATE_MARKER)
 HOLD = f"{HOLD_MARKER}\n**HOLD** · Waiting for the gate to evaluate runtime evidence."
+MAX_VERDICT_BYTES = 16384
 REVIEW_BOTS = {
     "garnet-runtime-review[bot]",
     "garnet-runtime-review-dev[bot]",
@@ -113,6 +115,9 @@ class API:
 
     def write(self, path, data, method="POST"):
         return self.call(FORK, path, method, data)
+
+    def viewer_login(self):
+        return self._request("user", "GET", None)["login"]
 
     def mark_ready(self, pr, upstream_number):
         if self.dry_run or mirror_revision(pr, upstream_number) is None:
@@ -491,18 +496,109 @@ class Mirror:
     def ensure_gate_comment(self, number):
         path = f"issues/{number}/comments"
         for comment in self.api.pages(FORK, path):
-            if comment["body"].startswith((HOLD_MARKER, GATE_MARKER)):
+            if (comment.get("body") or "").startswith(GATE_MARKERS):
                 return
         self.api.write(path, {"body": HOLD})
 
 
+def publish_verdict(api, number, head, verdict, reason, session=""):
+    if type(number) is not int or not 1 <= number <= 2**31 - 1:
+        raise ValueError("Expected a positive mirror PR number")
+    if not re.fullmatch(r"[a-f0-9]{40}", head):
+        raise ValueError("Expected a full head SHA")
+    if verdict not in ("PASS", "HOLD"):
+        raise ValueError("Expected PASS or HOLD")
+    if session and not re.fullmatch(r"[a-f0-9]{32}", session):
+        raise ValueError("Expected a Devin session ID")
+    reason = reason.strip()
+    if not reason or any(marker in reason for marker in GATE_MARKERS):
+        raise ValueError("Expected verdict details without gate markers")
+    body = (
+        f"{GATE_MARKER}\nHead: `{head}`\n\n**{verdict}** · {reason}"
+        "\n\nNot PR approval; merging policy still applies."
+    )
+    if session:
+        body += f"\n\n[Written by Devin](https://app.devin.ai/sessions/{session})"
+    if len(body.encode("utf-8")) > MAX_VERDICT_BYTES:
+        raise ValueError("Verdict comment must not exceed 16384 bytes")
+
+    path = f"pulls/{number}"
+
+    def checked_pair():
+        pr = api.call(FORK, path)
+        base = (pr.get("base") or {}).get("ref", "")
+        match = re.fullmatch(r"shadow/base/([1-9][0-9]*)(?:-r[0-9]+)?", base)
+        if (
+            pr.get("state") != "open"
+            or not match
+            or mirror_revision(pr, int(match[1])) is None
+        ):
+            raise ValueError("Expected an open, same-repository shadow mirror PR")
+        if pr["head"].get("sha") != head:
+            raise ValueError(
+                "PR head changed; evaluate the current head before publishing"
+            )
+        return base, pr["head"]["ref"]
+
+    pair = checked_pair()
+    comments_path = f"issues/{number}/comments"
+    existing = [
+        comment
+        for comment in api.pages(FORK, comments_path)
+        if (comment.get("body") or "").startswith(GATE_MARKERS)
+    ]
+    if len(existing) > 1:
+        raise ValueError(
+            "Multiple gate comments; refusing to add or overwrite a verdict"
+        )
+    if existing:
+        comment = existing[0]
+        if (comment.get("user") or {}).get("login") != api.viewer_login():
+            raise ValueError("Gate comment is not owned by the mirror token identity")
+        if comment["body"] == body:
+            return
+    if checked_pair() != pair:
+        raise ValueError("Mirror branch pair changed; refusing to publish")
+    if existing:
+        api.write(f'issues/comments/{existing[0]["id"]}', {"body": body}, "PATCH")
+    else:
+        api.write(comments_path, {"body": body})
+
+
 def main():
     parser = argparse.ArgumentParser()
-    sync = parser.add_subparsers(dest="command", required=True).add_parser("sync")
+    commands = parser.add_subparsers(dest="command", required=True)
+    sync = commands.add_parser("sync")
     sync.add_argument("--pr", type=int, action="append")
     sync.add_argument("--dry-run", action="store_true")
+    verdict = commands.add_parser("verdict")
+    verdict.add_argument("--pr", type=int, required=True)
+    verdict.add_argument("--head", required=True)
+    verdict.add_argument("--verdict", choices=("PASS", "HOLD"), required=True)
+    verdict.add_argument("--body", required=True)
+    verdict.add_argument("--session", default="")
     args = parser.parse_args()
-    token = os.environ.get("SHADOW_MIRROR_TOKEN") or os.environ.get("GH_TOKEN")
+    token = os.environ.get("SHADOW_MIRROR_TOKEN")
+    if args.command == "verdict":
+        if not token:
+            parser.error("Set SHADOW_MIRROR_TOKEN to publish a verdict")
+        try:
+            publish_verdict(
+                API(token, False),
+                args.pr,
+                args.head,
+                args.verdict,
+                args.body,
+                args.session,
+            )
+        except (APIError, OSError, ValueError) as error:
+            sys.stderr.write(f"Verdict not published: {error}\n")
+            return 1
+        sys.stdout.write(
+            f"Gate verdict is current on mirror PR #{args.pr} for {args.head}.\n"
+        )
+        return 0
+    token = token or os.environ.get("GH_TOKEN")
     if not token:
         parser.error("Set SHADOW_MIRROR_TOKEN or GH_TOKEN")
     api = API(token, args.dry_run)
