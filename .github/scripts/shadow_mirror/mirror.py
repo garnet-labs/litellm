@@ -20,7 +20,8 @@ MARKER = re.compile(
     r"upstream_base=([a-f0-9]{40}) -->"
 )
 HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
-HOLD = f"{HOLD_MARKER}\n**HOLD** · The runtime record isn't available to this gate yet."
+GATE_MARKER = "<!-- garnet-merge-gate -->"
+HOLD = f"{HOLD_MARKER}\n**HOLD** · Waiting for the gate to evaluate runtime evidence."
 REVIEW_BOTS = {
     "garnet-runtime-review[bot]",
     "garnet-runtime-review-dev[bot]",
@@ -331,7 +332,7 @@ class Mirror:
             upstream_head,
             upstream_base,
         ):
-            self.hold(existing["number"])
+            self.ensure_gate_comment(existing["number"])
             ready = self.ready_if_finalized(existing, number, revision)
             self.close(history, "superseded", keep=existing["number"])
             return {
@@ -382,7 +383,7 @@ class Mirror:
             result = api.write(
                 "pulls", {**data, "head": head_ref, "base": base_ref, "draft": True}
             )
-        self.hold(result["number"])
+        self.ensure_gate_comment(result["number"])
         self.close(history, "superseded", keep=result["number"])
         return {
             "status": "updated" if existing else "created",
@@ -487,14 +488,10 @@ class Mirror:
             "git/commits", {"tree": tree, "parents": parents, "message": message}
         )["sha"]
 
-    def hold(self, number):
+    def ensure_gate_comment(self, number):
         path = f"issues/{number}/comments"
         for comment in self.api.pages(FORK, path):
-            if comment["body"].startswith(HOLD_MARKER):
-                if comment["body"] != HOLD:
-                    self.api.write(
-                        f'issues/comments/{comment["id"]}', {"body": HOLD}, "PATCH"
-                    )
+            if comment["body"].startswith((HOLD_MARKER, GATE_MARKER)):
                 return
         self.api.write(path, {"body": HOLD})
 

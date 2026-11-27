@@ -10,6 +10,7 @@ from unittest.mock import Mock, call, patch
 from mirror import (
     API,
     FORK,
+    GATE_MARKER,
     HOLD,
     HOLD_MARKER,
     MARK_READY,
@@ -514,20 +515,23 @@ class ReplayTest(unittest.TestCase):
             f"actions/workflows/{WORKFLOW}/dispatches", {"ref": "shadow/base/1"}
         )
 
-    def test_gate_updates_its_comment_without_changing_other_comments(self):
-        self.api.pages.return_value = [
-            {"id": 1, "body": "unrelated"},
-            {"id": 2, "body": f"{HOLD_MARKER}\nold gate text"},
-        ]
-        self.mirror.hold(3)
+    def test_gate_comment_is_only_created_when_absent(self):
+        unrelated = {"id": 1, "body": "unrelated"}
+        self.api.pages.return_value = [unrelated]
+        self.mirror.ensure_gate_comment(3)
         self.api.pages.assert_called_once_with(FORK, "issues/3/comments")
-        self.api.write.assert_called_once_with(
-            "issues/comments/2", {"body": HOLD}, "PATCH"
-        )
-        self.api.reset_mock()
-        self.api.pages.return_value = [{"id": 2, "body": HOLD}]
-        self.mirror.hold(3)
-        self.api.write.assert_not_called()
+        self.api.write.assert_called_once_with("issues/3/comments", {"body": HOLD})
+
+        for marker in (HOLD_MARKER, GATE_MARKER):
+            for verdict in ("**PASS** · Nothing new recorded", "**HOLD** · Changed"):
+                with self.subTest(marker=marker, verdict=verdict):
+                    self.api.reset_mock()
+                    self.api.pages.return_value = [
+                        unrelated,
+                        {"id": 2, "body": f"{marker}\n{verdict}"},
+                    ]
+                    self.mirror.ensure_gate_comment(3)
+                    self.api.write.assert_not_called()
 
 
 if __name__ == "__main__":
