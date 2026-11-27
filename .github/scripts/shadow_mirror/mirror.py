@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 FORK = "garnet-labs/litellm"
 SOURCE = "BerriAI/litellm"
@@ -22,6 +23,8 @@ MARKER = re.compile(
 HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
 HOLD = f"{HOLD_MARKER}\n**HOLD** · The runtime record isn't available to this gate yet."
 DEPENDENCY_BOTS = {"dependabot[bot]", "renovate[bot]"}
+MERGED_LOOKBACK = timedelta(days=14)
+UTC = timezone.utc  # noqa: UP017
 PYTHON_INPUTS = {"pyproject.toml", "poetry.lock", "uv.lock"}
 NPM_INSTALL_DIRS = {
     "ui/litellm-dashboard",
@@ -116,6 +119,23 @@ class API:
                 return
             cursor = page["endCursor"]
 
+    def merged_dependency_candidates(self, cutoff):
+        authors = " ".join(
+            f"author:app/{bot.removesuffix('[bot]')}" for bot in sorted(DEPENDENCY_BOTS)
+        )
+        query = f"repo:{SOURCE} is:pr is:merged merged:>={cutoff.date()} {authors}"
+        for page in range(1, 11):
+            params = urllib.parse.urlencode({"q": query, "per_page": 100, "page": page})
+            result = self._request(f"search/issues?{params}", "GET", None)
+            if result["incomplete_results"]:
+                raise RuntimeError(
+                    "GitHub recent merged PR search returned incomplete results"
+                )
+            yield from (pr["number"] for pr in result["items"])
+            if page * 100 >= result["total_count"]:
+                return
+        raise RuntimeError("GitHub recent merged PR search exceeded 1000 results")
+
 
 def dependency_file(path):
     directory, _, name = path.rpartition("/")
@@ -124,14 +144,18 @@ def dependency_file(path):
     )
 
 
+def is_dependency_bot(pr):
+    author = pr["user"] or {}
+    return (
+        author.get("login", "").lower() in DEPENDENCY_BOTS
+        and author.get("type") == "Bot"
+    )
+
+
 def is_dependency_pr(pr, files):
     if not files or pr["changed_files"] != len(files):
         return False
-    author = pr["user"] or {}
-    if (
-        author.get("login", "").lower() in DEPENDENCY_BOTS
-        and author.get("type") == "Bot"
-    ):
+    if is_dependency_bot(pr):
         return any(
             dependency_file(file["filename"])
             or dependency_file(file.get("previous_filename", ""))
@@ -190,6 +214,7 @@ def mirror_revision(pr, number):
 class Mirror:
     def __init__(self, api):
         self.api = api
+        self.merge_cutoff = datetime.now(UTC) - MERGED_LOOKBACK
         self.mirrors = {}
         for pr in api.pages(FORK, "pulls?state=all"):
             marker = MARKER.search(pr.get("body") or "")
@@ -201,23 +226,34 @@ class Mirror:
                 self.mirrors.setdefault(number, {})[revision] = pr
         self.workflow = None
 
+    def source_in_scope(self, pr):
+        if pr["state"] == "open":
+            return True
+        merged = pr.get("merged_at")
+        return (
+            bool(merged)
+            and is_dependency_bot(pr)
+            and datetime.strptime(merged, "%Y-%m-%dT%H:%M:%S%z") >= self.merge_cutoff
+        )
+
     def sync(self, number):
         api = self.api
         history = self.mirrors.get(number, {})
         path = f"pulls/{number}"
         try:
             pr = api.call(SOURCE, path)
-            if pr["state"] == "open":
-                files = list(api.pages(SOURCE, f"{path}/files"))
-                current = api.call(SOURCE, path)
+            if not self.source_in_scope(pr):
+                return self.close(history, "source closed")
+            files = list(api.pages(SOURCE, f"{path}/files"))
+            current = api.call(SOURCE, path)
         except APIError as error:
             if error.status != 404:
                 raise
             return {"status": "skipped", "reason": "upstream PR not found"}
-        if pr["state"] != "open":
-            return self.close(history, "source closed")
-        if any(current[key] != pr[key] for key in ("state", "changed_files")) or any(
-            current[key]["sha"] != pr[key]["sha"] for key in ("base", "head")
+        if (
+            any(current[key] != pr[key] for key in ("state", "changed_files"))
+            or any(current[key]["sha"] != pr[key]["sha"] for key in ("base", "head"))
+            or not self.source_in_scope(current)
         ):
             return {"status": "source changed during discovery"}
         if pr["changed_files"] != len(files):
@@ -430,6 +466,7 @@ def main():
     numbers = args.pr
     if not numbers:
         numbers = list(api.dependency_candidates())
+        numbers.extend(api.merged_dependency_candidates(mirror.merge_cutoff))
         numbers.extend(
             number
             for number, history in mirror.mirrors.items()
