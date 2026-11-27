@@ -1,0 +1,31 @@
+name: Linux validation
+
+on:
+  push:
+    branches: [ci-linux-validation]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          persist-credentials: false
+      - uses: "garnet-org/action@v2.6.0"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "3.12"
+      - name: "Set up Poetry"
+        run: |
+          pip install 'poetry==2.3.2'
+      - name: "Install dependencies"
+        run: |
+          poetry install --with dev,proxy-dev --extras "proxy semantic-router"
+      - name: "Run checks"
+        run: |
+          poetry run pytest tests/test_litellm/litellm_core_utils/test_duration_parser.py --tb=short -vv
