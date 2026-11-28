@@ -1,0 +1,1353 @@
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Optional, cast
+
+import openai
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import ORJSONResponse
+from pydantic import TypeAdapter
+
+import litellm
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.llms.base_llm.managed_resources.utils import (
+    extract_target_model_names_from_unified_id,
+    is_base64_encoded_unified_id,
+)
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.common_utils.openai_endpoint_utils import (
+    get_custom_llm_provider_from_request_body,
+    get_custom_llm_provider_from_request_headers,
+    get_custom_llm_provider_from_request_query,
+)
+from litellm.proxy.openai_files_endpoints.common_utils import (
+    authorize_model_for_key,
+    caller_may_use_model,
+    carries_explicit_credentials,
+    explicit_request_credentials,
+    get_credentials_for_model,
+    get_team_provider_deployment,
+    handle_model_based_routing,
+    managed_file_copy_on_deployment,
+    managed_file_ids_for_provider_file_ids,
+    prepare_data_with_credentials,
+    provider_file_id_from_managed_id,
+    team_deployment_the_caller_may_use,
+)
+from litellm.proxy.rag_endpoints.upload_security import safe_download_headers
+from litellm.proxy.vector_store_endpoints.utils import (
+    assert_user_can_access_vector_store_id,
+    is_allowed_to_call_vector_store_files_endpoint,
+)
+from litellm.router_rust.invoke.endpoints import PINNED_DEPLOYMENT_KEY
+from litellm.types.router import Deployment
+from litellm.types.utils import LlmProviders
+from litellm.types.vector_store_files import (
+    VectorStoreFileListResponse,
+    VectorStoreFileObject,
+)
+from litellm.types.vector_stores import LiteLLM_ManagedVectorStore
+from litellm.vector_store_files.main import aretrieve as vector_store_file_aretrieve
+
+if TYPE_CHECKING:
+    from litellm.router import Router
+
+router: Final = APIRouter()
+
+
+def _with_provider_file_id_cursors(
+    query_params: Mapping[str, str],
+) -> Mapping[str, str | None]:
+    return MappingProxyType(
+        {
+            key: (provider_file_id_from_managed_id(value) if key in {"after", "before"} else value)
+            for key, value in query_params.items()
+        }
+    )
+
+
+def _managed_file_id_or_original(
+    file_id: str | None,
+    id_map: Mapping[str, str],
+) -> str | None:
+    return id_map.get(file_id, file_id) if file_id is not None else None
+
+
+def _with_managed_file_id(
+    file: VectorStoreFileObject,
+    id_map: Mapping[str, str],
+) -> VectorStoreFileObject:
+    file_id: Final = file.get("id")
+    if not isinstance(file_id, str) or file_id not in id_map:
+        return file
+    managed_file: Final[VectorStoreFileObject] = {**file, "id": id_map[file_id]}
+    return managed_file
+
+
+def _with_managed_file_ids(
+    response: VectorStoreFileListResponse,
+    id_map: Mapping[str, str],
+) -> VectorStoreFileListResponse:
+    data: Final = response.get("data")
+    if not data:
+        return response
+
+    first_id: Final = response.get("first_id")
+    last_id: Final = response.get("last_id")
+    mapped_data: Final = [_with_managed_file_id(file, id_map) for file in data]
+    mapped_response: Final[VectorStoreFileListResponse] = {
+        **response,
+        "data": mapped_data,
+        "first_id": _managed_file_id_or_original(first_id, id_map),
+        "last_id": _managed_file_id_or_original(last_id, id_map),
+    }
+    return mapped_response
+
+
+async def _with_managed_file_list_ids(
+    response: VectorStoreFileListResponse,
+    managed_files_obj: object | None,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> VectorStoreFileListResponse:
+    data: Final = response.get("data")
+    if not data:
+        return response
+
+    id_map: Final = await managed_file_ids_for_provider_file_ids(
+        tuple(provider_file_id for file in data if isinstance(provider_file_id := file.get("id"), str)),
+        managed_files_obj,
+        user_api_key_dict,
+    )
+    return _with_managed_file_ids(response, id_map)
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedFileCopy:
+    deployment_id: str
+    provider_file_id: str
+
+
+_PROBE_ARGUMENTS: Final = frozenset(
+    {"vector_store_id", "file_id", "extra_headers", "timeout", "custom_llm_provider", "no-log"}
+)
+_EXTRA_HEADERS: Final = TypeAdapter(dict[str, str] | None)
+
+
+async def _store_lacks_file(
+    provider: LlmProviders, vector_store_id: str, file_id: str, credentials: Mapping[str, object]
+) -> bool:
+    try:
+        await vector_store_file_aretrieve(
+            vector_store_id=vector_store_id,
+            file_id=file_id,
+            extra_headers=_EXTRA_HEADERS.validate_python(credentials.get("extra_headers")),
+            timeout=None,
+            custom_llm_provider=provider.value,
+            **{key: value for key, value in credentials.items() if key not in _PROBE_ARGUMENTS},
+            **{"no-log": True},
+        )
+    except openai.NotFoundError:
+        return True
+    except openai.APIError:
+        return False
+    return False
+
+
+def _raw_vector_store_id(data: Mapping[str, object]) -> str | None:
+    vector_store_id: Final = data.get("vector_store_id")
+    if not isinstance(vector_store_id, str) or is_base64_encoded_unified_id(vector_store_id):
+        return None
+    return vector_store_id
+
+
+async def _caller_team_copy_of_managed_file(
+    provider: LlmProviders | None,
+    file_id: str,
+    upload_copy: str | None,
+    upload_credentials: Mapping[str, object] | None,
+    vector_store_id: str,
+    user_api_key_dict: UserAPIKeyAuth,
+    managed_files_obj: object | None,
+    llm_router: Optional["Router"],
+) -> _ManagedFileCopy | None:
+    if provider is None:
+        return None
+    team_deployment: Final = await team_deployment_the_caller_may_use(
+        get_team_provider_deployment(llm_router, user_api_key_dict, provider.value), llm_router, user_api_key_dict
+    )
+    provider_file_id: Final = await managed_file_copy_on_deployment(
+        file_id, team_deployment, managed_files_obj, user_api_key_dict.parent_otel_span
+    )
+    if team_deployment is None or provider_file_id is None:
+        return None
+    team_copy: Final = _ManagedFileCopy(team_deployment.deployment_id, provider_file_id)
+    if provider_file_id == upload_copy:
+        return team_copy
+    store_lacks_upload_copy: Final = (
+        upload_copy is None
+        or upload_credentials is None
+        or await _store_lacks_file(provider, vector_store_id, upload_copy, upload_credentials)
+    )
+    return team_copy if store_lacks_upload_copy else None
+
+
+def _store_carries_credentials(store: LiteLLM_ManagedVectorStore | None) -> bool:
+    return store is not None and (
+        carries_explicit_credentials(store.get("litellm_params") or MappingProxyType({}))
+        or carries_explicit_credentials(
+            MappingProxyType({"litellm_credential_name": store.get("litellm_credential_name")})
+        )
+    )
+
+
+_CALLER_DESTINATION_KEYS: Final = frozenset({"api_base", "base_url"})
+
+
+def _keys_a_pinned_call_drops(data: Mapping[str, object]) -> frozenset[str]:
+    if explicit_request_credentials(data):
+        return frozenset({"custom_llm_provider"})
+    return frozenset({"custom_llm_provider", *_CALLER_DESTINATION_KEYS})
+
+
+def _public_model_name_reaching(llm_router: "Router", deployment: Deployment, team_id: str | None) -> str | None:
+    public_model_name: Final = deployment.model_info.team_public_model_name or deployment.model_name
+    reachable_ids: Final = frozenset(
+        (as_str_mapping(row.get("model_info")) or {}).get("id")
+        for row in llm_router.registry().deployments(
+            public_model_name, source="for_request", request={"metadata": {"user_api_key_team_id": team_id}}
+        )
+    )
+    return public_model_name if deployment.model_info.id in reachable_ids else None
+
+
+async def _update_request_data_with_managed_file_id(
+    data: dict,
+    file_id: str,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    managed_files_obj: object | None,
+    llm_router: Optional["Router"] = None,
+    managed_vector_store: LiteLLM_ManagedVectorStore | None = None,
+) -> tuple[dict, str | None]:
+    """
+    Update request data with model routing information from managed file ID.
+
+    This function handles two types of file IDs:
+    1. Simple encoded file IDs (format: litellm:{file_id};model,{model})
+    2. Unified managed file IDs (format: litellm_proxy:{mime};unified_id,{uuid};...;llm_output_file_id,{file_id};...)
+
+    For unified managed file IDs, it:
+    - Decodes the unified ID to extract the actual provider file ID (llm_output_file_id)
+    - Extracts the model routing information (target_model_names)
+    - Updates data with credentials for the correct deployment
+
+    Args:
+        data: Request data to update
+        file_id: File ID (can be managed/encoded or regular)
+        request: FastAPI request object
+        llm_router: LiteLLM router for credential lookup (required for managed files)
+
+    Returns:
+        Tuple of (updated request data, original_managed_file_id)
+        - original_managed_file_id is the original file_id if it was managed/encoded, None otherwise
+    """
+    from litellm import verbose_logger
+    from litellm.llms.base_llm.managed_resources.utils import (
+        parse_unified_id,
+    )
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        validate_managed_id_requirement,
+    )
+
+    await validate_managed_id_requirement(
+        resource_id=file_id,
+        resource_kind="file",
+        user_api_key_dict=user_api_key_dict,
+        managed_files_obj=managed_files_obj,
+    )
+
+    # First, check if this is a unified managed file ID (base64 encoded)
+    decoded_id: Final = is_base64_encoded_unified_id(file_id)
+
+    if decoded_id:
+        # This is a unified managed file ID
+        verbose_logger.debug("Processing unified managed file ID: %s", file_id)
+
+        # Parse the unified ID to extract components
+        parsed_id: Final = parse_unified_id(file_id)
+
+        if parsed_id:
+            target_model_names: Final = extract_target_model_names_from_unified_id(decoded_id)
+
+            # Extract the actual provider file ID from llm_output_file_id field
+            # Format: litellm_proxy:...;llm_output_file_id,{actual_file_id};...
+            llm_output_file_id = None
+            try:
+                match: Final = re.search(r"llm_output_file_id,([^;]+)", decoded_id)
+                if match:
+                    llm_output_file_id = match.group(1).strip()
+            except Exception:
+                pass
+
+            verbose_logger.debug(
+                "Decoded unified file ID - target_model_names: %s, llm_output_file_id: %s",
+                target_model_names,
+                llm_output_file_id,
+            )
+
+            stored_deployment_match: Final = re.search(r";llm_output_file_model_id,([^;]+)", decoded_id)
+            stored_deployment_id: Final = stored_deployment_match.group(1).strip() if stored_deployment_match else None
+            stored_deployment: Final = (
+                llm_router.registry().credentials(stored_deployment_id, form="deployment")
+                if stored_deployment_id and llm_router
+                else None
+            )
+            raw_vector_store_id: Final = _raw_vector_store_id(data)
+            upload_deployment_id: Final = (
+                stored_deployment_id
+                if raw_vector_store_id is not None
+                and stored_deployment is not None
+                and stored_deployment.model_info.team_id in (None, user_api_key_dict.team_id)
+                and await caller_may_use_model(
+                    stored_deployment.model_info.team_public_model_name or stored_deployment.model_name,
+                    llm_router,
+                    user_api_key_dict,
+                )
+                else None
+            )
+            upload_routing_model: Final = upload_deployment_id or (
+                target_model_names[0] if target_model_names else None
+            )
+            team_copy: Final = (
+                None
+                if raw_vector_store_id is None
+                or carries_explicit_credentials(data)
+                or _store_carries_credentials(managed_vector_store)
+                else await _caller_team_copy_of_managed_file(
+                    await _resolve_provider(data=data, request=request),
+                    file_id,
+                    llm_output_file_id,
+                    (
+                        llm_router.registry().credentials(upload_routing_model, form="with_provider")
+                        if llm_router and upload_routing_model
+                        else None
+                    ),
+                    raw_vector_store_id,
+                    user_api_key_dict,
+                    managed_files_obj,
+                    llm_router,
+                )
+            )
+            routing_deployment_id: Final = team_copy.deployment_id if team_copy is not None else upload_deployment_id
+            routing_deployment: Final = (
+                llm_router.registry().credentials(routing_deployment_id, form="deployment")
+                if llm_router and routing_deployment_id
+                else None
+            )
+            provider_file_id: Final = team_copy.provider_file_id if team_copy is not None else llm_output_file_id
+            if llm_router and routing_deployment is not None:
+                verbose_logger.info(
+                    "Routing vector store file operation to deployment: %s, file_id: %s -> %s",
+                    routing_deployment_id,
+                    file_id,
+                    provider_file_id,
+                )
+                dropped_keys: Final = _keys_a_pinned_call_drops(data)
+                return {
+                    **{key: value for key, value in data.items() if key not in dropped_keys},
+                    "model": _public_model_name_reaching(llm_router, routing_deployment, user_api_key_dict.team_id)
+                    or routing_deployment_id,
+                    "file_id": provider_file_id,
+                    PINNED_DEPLOYMENT_KEY: routing_deployment_id,
+                }, file_id
+            routing_model: Final = team_copy.deployment_id if team_copy is not None else upload_routing_model
+            if routing_model:
+                data["model"] = routing_model
+
+                # Get credentials for the model
+                if llm_router:
+                    credentials = llm_router.registry().credentials(routing_model, form="with_provider")
+                    if credentials:
+                        prepare_data_with_credentials(
+                            data=data,
+                            credentials=credentials,
+                            file_id=provider_file_id,
+                        )
+                        verbose_logger.info(
+                            "Routing vector store file operation to model: %s, file_id: %s -> %s",
+                            routing_model,
+                            file_id,
+                            provider_file_id,
+                        )
+                        return data, file_id  # Return original managed file ID
+
+            # If we extracted the provider file ID but no routing, still use it
+            if llm_output_file_id:
+                data["file_id"] = llm_output_file_id
+                verbose_logger.debug("Replaced unified file ID with provider file ID: %s", llm_output_file_id)
+                return data, file_id  # Return original managed file ID
+
+        return data, file_id if decoded_id else None
+
+    # Fall back to simple encoded file ID handling (format: litellm:{file_id};model,{model})
+    (
+        should_route,
+        model_used,
+        original_file_id,
+        credentials,
+    ) = await handle_model_based_routing(
+        file_id=file_id,
+        request=request,
+        llm_router=llm_router,
+        data=data,
+        user_api_key_dict=user_api_key_dict,
+        check_file_id_encoding=True,
+    )
+
+    if should_route:
+        # Use model-based routing with credentials from config
+        prepare_data_with_credentials(
+            data=data,
+            credentials=credentials,
+            file_id=original_file_id,  # Use decoded file ID if from encoded ID
+        )
+
+        verbose_logger.debug(
+            f"Routing vector store file operation using model: {model_used}"
+            + (f", file_id: {file_id} -> {original_file_id}" if original_file_id else "")
+        )
+        return data, file_id  # Return original file ID for response replacement
+
+    return data, None
+
+
+def _replace_file_id_in_response(response, original_file_id: str):
+    """
+    Replace the provider file ID in the response with the original managed file ID.
+
+    This ensures that when a user sends a managed file ID, they get back the same
+    managed file ID in the response, not the decoded provider file ID.
+
+    Args:
+        response: The response object from the provider
+        original_file_id: The original managed file ID to restore
+
+    Returns:
+        Modified response with original file ID
+    """
+    if response is None:
+        return response
+
+    # Handle different response types
+    if isinstance(response, dict):
+        # For dict responses (e.g., VectorStoreFileDeleteResponse)
+        if "id" in response:
+            response["id"] = original_file_id
+        if "file_id" in response:
+            response["file_id"] = original_file_id
+    elif hasattr(response, "id"):
+        # For object responses (e.g., VectorStoreFileObject)
+        response.id = original_file_id
+    elif hasattr(response, "file_id"):
+        response.file_id = original_file_id
+
+    return response
+
+
+async def _authorize_model_routing_hint(
+    *,
+    model: str,
+    llm_router: Optional["Router"],
+    user_api_key_dict: UserAPIKeyAuth | None,
+) -> None:
+    if user_api_key_dict is None:
+        return
+    await authorize_model_for_key(model_id=model, llm_router=llm_router, user_api_key_dict=user_api_key_dict)
+
+
+async def _update_request_data_with_model_routing_hint(
+    data: dict,
+    request: Request,
+    llm_router: Optional["Router"] = None,
+    user_api_key_dict: UserAPIKeyAuth | None = None,
+) -> dict:
+    if data.get("api_key") is not None or data.get("api_base") is not None:
+        return data
+
+    user_controlled_model_hint: Final = request.query_params.get("model") or request.headers.get("x-litellm-model")
+    model_hint: Final = data.get("model") or user_controlled_model_hint
+    should_authorize_model_hint: Final = isinstance(model_hint, str) and model_hint == user_controlled_model_hint
+
+    caller_team_id: Final = getattr(user_api_key_dict, "team_id", None) if user_api_key_dict else None
+
+    should_route = False
+    credentials = None
+    if isinstance(model_hint, str) and "*" in model_hint:
+        if llm_router is not None:
+            if should_authorize_model_hint:
+                await _authorize_model_routing_hint(
+                    model=model_hint,
+                    llm_router=llm_router,
+                    user_api_key_dict=user_api_key_dict,
+                )
+            credentials = llm_router.registry().credentials(model_hint, form="with_provider", team_id=caller_team_id)
+            should_route = credentials is not None
+    elif isinstance(model_hint, str):
+        if should_authorize_model_hint:
+            await _authorize_model_routing_hint(
+                model=model_hint,
+                llm_router=llm_router,
+                user_api_key_dict=user_api_key_dict,
+            )
+        credentials = get_credentials_for_model(llm_router=llm_router, model_id=model_hint)
+        should_route = True
+
+    if should_route and credentials is not None:
+        prepare_data_with_credentials(
+            data=data,
+            credentials=credentials,
+        )
+        return data
+
+    if llm_router is None or user_api_key_dict is None:
+        return data
+
+    team_models: Final = getattr(user_api_key_dict, "team_models", None) or []
+    if not isinstance(team_models, list):
+        return data
+
+    model_names_to_check: Final = []
+    for model_name in team_models:
+        if not isinstance(model_name, str) or model_name in {
+            "all-team-models",
+            "all-proxy-models",
+            "no-default-models",
+        }:
+            continue
+        model_names_to_check.append(model_name)
+
+    openai_credentials = None
+    for model_name in model_names_to_check:
+        credentials = llm_router.registry().credentials(model_name, form="with_provider", team_id=caller_team_id)
+        if credentials is None:
+            continue
+
+        provider = credentials.get("custom_llm_provider")
+        model = credentials.get("model")
+        if provider is None and isinstance(model, str) and "/" in model:
+            provider = model.split("/", 1)[0]
+        if provider != LlmProviders.OPENAI.value:
+            continue
+
+        await _authorize_model_routing_hint(
+            model=model_name,
+            llm_router=llm_router,
+            user_api_key_dict=user_api_key_dict,
+        )
+        if openai_credentials is not None:
+            return data
+        openai_credentials = credentials
+
+    if openai_credentials is not None:
+        prepare_data_with_credentials(data=data, credentials=openai_credentials)
+    elif len(model_names_to_check) == 1:
+        await _authorize_model_routing_hint(
+            model=model_names_to_check[0],
+            llm_router=llm_router,
+            user_api_key_dict=user_api_key_dict,
+        )
+        data["model"] = model_names_to_check[0]
+
+    return data
+
+
+def _update_request_data_with_litellm_managed_vector_store_registry(
+    data: dict,
+    vector_store_id: str,
+    llm_router: Optional["Router"] = None,
+    managed_vector_store: LiteLLM_ManagedVectorStore | None = None,
+    should_lookup_registry: bool = True,
+) -> dict:
+    """
+    Update request data with model routing information from managed vector store.
+
+    This function handles two types of vector stores:
+    1. Legacy vector stores from registry (non-managed)
+    2. Managed vector stores with unified IDs (requires decoding)
+
+    For managed vector stores, this function:
+    - Decodes the unified vector store ID
+    - Extracts the model_id and provider resource ID
+    - Sets data["model"] so the router can use the correct deployment credentials
+    - Replaces the unified ID with the provider-specific ID
+
+    Args:
+        data: Request data to update
+        vector_store_id: Vector store ID (can be unified or legacy)
+        llm_router: LiteLLM router for credential lookup (required for managed vector stores)
+
+    Returns:
+        Updated request data with model routing information
+    """
+    from litellm import verbose_logger
+    from litellm.llms.base_llm.managed_resources.utils import (
+        is_base64_encoded_unified_id,
+        parse_unified_id,
+    )
+
+    # Check if this is a managed vector store ID (base64 encoded unified ID)
+    decoded_id: Final = is_base64_encoded_unified_id(vector_store_id)
+
+    if decoded_id:
+        # This is a managed vector store - decode and extract routing information
+        verbose_logger.debug("Processing managed vector store ID: %s", vector_store_id)
+
+        parsed_id: Final = parse_unified_id(vector_store_id)
+
+        if parsed_id:
+            model_id: Final = parsed_id.get("model_id")
+            provider_resource_id: Final = parsed_id.get("provider_resource_id")
+            target_model_names: Final = extract_target_model_names_from_unified_id(decoded_id)
+
+            verbose_logger.debug(
+                "Decoded vector store - model_id: %s, provider_resource_id: %s, target_model_names: %s",
+                model_id,
+                provider_resource_id,
+                target_model_names,
+            )
+
+            # Set the model for routing - this tells the router which deployment to use
+            # The router will automatically get the credentials from the deployment
+            routing_model = None
+            if model_id:
+                routing_model = model_id
+            elif target_model_names and len(target_model_names) > 0:
+                routing_model = target_model_names[0]
+
+            if routing_model:
+                data["model"] = routing_model
+                verbose_logger.info("Routing vector store files operation to model: %s", routing_model)
+
+            # Replace unified vector store ID with provider resource ID
+            if provider_resource_id:
+                data["vector_store_id"] = provider_resource_id
+                verbose_logger.debug(
+                    "Replaced unified vector store ID with provider resource ID: %s", provider_resource_id
+                )
+
+        return data
+
+    # Legacy path: Check vector store registry for non-managed vector stores.
+    vector_store_to_run = managed_vector_store
+    if vector_store_to_run is None and should_lookup_registry and litellm.vector_store_registry is not None:
+        vector_store_to_run = litellm.vector_store_registry.get_litellm_managed_vector_store_from_registry(
+            vector_store_id=vector_store_id
+        )
+
+    if vector_store_to_run is not None:
+        if "custom_llm_provider" in vector_store_to_run:
+            data["custom_llm_provider"] = vector_store_to_run.get("custom_llm_provider")
+        if "litellm_credential_name" in vector_store_to_run:
+            data["litellm_credential_name"] = vector_store_to_run.get("litellm_credential_name")
+        if "litellm_params" in vector_store_to_run:
+            litellm_params: Final = vector_store_to_run.get("litellm_params", {}) or {}
+            data.update(litellm_params)
+
+    return data
+
+
+async def _resolve_provider(
+    *,
+    data: dict,
+    request: Request,
+) -> LlmProviders | None:
+    provider = (
+        data.get("custom_llm_provider")
+        or get_custom_llm_provider_from_request_headers(request=request)
+        or get_custom_llm_provider_from_request_query(request=request)
+    )
+
+    if provider is None and request.method in {"POST", "PUT", "PATCH"}:
+        provider = await get_custom_llm_provider_from_request_body(request=request)
+
+    if provider is None:
+        provider = "openai"
+
+    try:
+        return LlmProviders(provider)
+    except Exception:
+        return None
+
+
+def _maybe_check_permissions(
+    *,
+    provider: LlmProviders | None,
+    vector_store_id: str,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    if provider is None:
+        return
+    metadata: Final = user_api_key_dict.metadata or {}
+    team_metadata: Final = user_api_key_dict.team_metadata or {}
+    if not metadata.get("allowed_vector_store_indexes") and not team_metadata.get("allowed_vector_store_indexes"):
+        return
+    is_allowed_to_call_vector_store_files_endpoint(
+        provider=provider,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+
+@router.post(
+    "/v1/vector_stores/{vector_store_id}/files",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.post(
+    "/vector_stores/{vector_store_id}/files",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_create(
+    vector_store_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        read_request_body,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
+    data["vector_store_id"] = vector_store_id
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    # Handle managed file IDs if present in request body
+    original_managed_file_id = None
+    if "file_id" in data:
+        data, original_managed_file_id = await _update_request_data_with_managed_file_id(
+            data=data,
+            file_id=data["file_id"],
+            request=request,
+            user_api_key_dict=user_api_key_dict,
+            managed_files_obj=proxy_logging_obj.get_proxy_hook("managed_files"),
+            llm_router=llm_router,
+            managed_vector_store=managed_vector_store,
+        )
+
+    # Then handle managed vector store IDs
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: object = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_create",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+        # Replace provider file ID with original managed file ID in response
+        if original_managed_file_id:
+            response = _replace_file_id_in_response(response, original_managed_file_id)
+
+        return response
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
+
+
+@router.get(
+    "/v1/vector_stores/{vector_store_id}/files",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.get(
+    "/vector_stores/{vector_store_id}/files",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_list(
+    vector_store_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    query_params: Final = _with_provider_file_id_cursors(request.query_params)
+    data: dict[str, str | None] = {"vector_store_id": vector_store_id}
+    data.update(query_params)
+    data["vector_store_id"] = vector_store_id
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    data = await _update_request_data_with_model_routing_hint(
+        data=data,
+        request=request,
+        llm_router=llm_router,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: Final[object] = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_list",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+        if not isinstance(response, dict):
+            return response
+        managed_files_obj: Final[object | None] = proxy_logging_obj.get_proxy_hook("managed_files")
+        return await _with_managed_file_list_ids(
+            response=cast(  # cast-ok: [LIT006] this route returns the provider's file-list response shape
+                VectorStoreFileListResponse,
+                response,
+            ),
+            managed_files_obj=managed_files_obj,
+            user_api_key_dict=user_api_key_dict,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
+
+
+@router.get(
+    "/v1/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.get(
+    "/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_retrieve(
+    vector_store_id: str,
+    file_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    data: dict[str, str] = {
+        "vector_store_id": vector_store_id,
+        "file_id": file_id,
+    }
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    # Handle managed file IDs first
+    data, original_managed_file_id = await _update_request_data_with_managed_file_id(
+        data=data,
+        file_id=file_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        managed_files_obj=proxy_logging_obj.get_proxy_hook("managed_files"),
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+    )
+
+    # Then handle managed vector store IDs
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: object = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_retrieve",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+        # Replace provider file ID with original managed file ID in response
+        if original_managed_file_id:
+            response = _replace_file_id_in_response(response, original_managed_file_id)
+
+        return response
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
+
+
+@router.get(
+    "/v1/vector_stores/{vector_store_id}/files/{file_id}/content",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.get(
+    "/vector_stores/{vector_store_id}/files/{file_id}/content",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_content(
+    vector_store_id: str,
+    file_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    data: dict[str, str] = {
+        "vector_store_id": vector_store_id,
+        "file_id": file_id,
+    }
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    # Handle managed file IDs first
+    data, original_managed_file_id = await _update_request_data_with_managed_file_id(
+        data=data,
+        file_id=file_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        managed_files_obj=proxy_logging_obj.get_proxy_hook("managed_files"),
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+    )
+
+    # Then handle managed vector store IDs
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: object = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_content",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+        # Replace provider file ID with original managed file ID in response
+        if original_managed_file_id:
+            response = _replace_file_id_in_response(response, original_managed_file_id)
+
+        for header_name, header_value in safe_download_headers(file_id).items():
+            fastapi_response.headers[header_name] = header_value
+
+        return response
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
+
+
+@router.post(
+    "/v1/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.post(
+    "/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_update(
+    vector_store_id: str,
+    file_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        read_request_body,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
+    data["vector_store_id"] = vector_store_id
+    data["file_id"] = file_id
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    # Handle managed file IDs first
+    data, original_managed_file_id = await _update_request_data_with_managed_file_id(
+        data=data,
+        file_id=file_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        managed_files_obj=proxy_logging_obj.get_proxy_hook("managed_files"),
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+    )
+
+    # Then handle managed vector store IDs
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: object = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_update",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+        # Replace provider file ID with original managed file ID in response
+        if original_managed_file_id:
+            response = _replace_file_id_in_response(response, original_managed_file_id)
+
+        return response
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
+
+
+@router.delete(
+    "/v1/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+@router.delete(
+    "/vector_stores/{vector_store_id}/files/{file_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["vector_store_files"],
+)
+async def vector_store_file_delete(
+    vector_store_id: str,
+    file_id: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+
+    data: dict[str, str] = {
+        "vector_store_id": vector_store_id,
+        "file_id": file_id,
+    }
+    managed_vector_store: Final = await assert_user_can_access_vector_store_id(
+        vector_store_id=vector_store_id,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    # Handle managed file IDs first
+    data, original_managed_file_id = await _update_request_data_with_managed_file_id(
+        data=data,
+        file_id=file_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        managed_files_obj=proxy_logging_obj.get_proxy_hook("managed_files"),
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+    )
+
+    # Then handle managed vector store IDs
+    data = _update_request_data_with_litellm_managed_vector_store_registry(
+        data=data,
+        vector_store_id=vector_store_id,
+        llm_router=llm_router,
+        managed_vector_store=managed_vector_store,
+        should_lookup_registry=False,
+    )
+
+    provider_enum: Final = await _resolve_provider(data=data, request=request)
+
+    _maybe_check_permissions(
+        provider=provider_enum,
+        vector_store_id=vector_store_id,
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+    )
+    if provider_enum is not None and "custom_llm_provider" not in data:
+        data["custom_llm_provider"] = provider_enum.value
+
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        response: object = await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="avector_store_file_delete",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+
+        # Replace provider file ID with original managed file ID in response
+        if original_managed_file_id:
+            response = _replace_file_id_in_response(response, original_managed_file_id)
+
+        return response
+    except Exception as e:  # noqa: BLE001
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
