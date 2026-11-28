@@ -1,0 +1,158 @@
+"""
+MCP Security Guardrail for LiteLLM.
+
+Validates that MCP servers referenced in request tools are registered
+on the LiteLLM gateway. Blocks or alerts when unregistered servers are found.
+"""
+
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal
+
+from fastapi import HTTPException
+
+from litellm._logging import verbose_proxy_logger
+from litellm.integrations.custom_guardrail import (
+    CustomGuardrail,
+    log_guardrail_information,
+)
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.responses.mcp.litellm_proxy_mcp_handler import (
+    LITELLM_PROXY_MCP_SERVER_URL_PREFIX,
+    read_saved_toolset,
+)
+from litellm.types.guardrails import GuardrailEventHooks
+
+if TYPE_CHECKING:
+    from litellm.caching.caching import DualCache
+
+
+def _servers_whose_toolset_read(unregistered: Mapping[str, Exception | None], failed: bool) -> tuple[str, ...]:
+    return tuple(sorted(name for name, error in unregistered.items() if (error is not None) is failed))
+
+
+def _violation_message(missing: tuple[str, ...], unverified: tuple[str, ...]) -> str:
+    findings: Final = (
+        (
+            f"request references unregistered MCP server(s): {', '.join(missing)}. "
+            "Only servers registered on this gateway are allowed."
+            if missing
+            else ""
+        ),
+        (
+            f"could not read the saved toolset of MCP server(s): {', '.join(unverified)}, "
+            "so the gateway cannot verify them."
+            if unverified
+            else ""
+        ),
+    )
+    return "MCP Security: " + " ".join(filter(None, findings))
+
+
+def _blocking_error(missing: tuple[str, ...], unverified: tuple[str, ...], message: str) -> HTTPException:
+    if missing:
+        return HTTPException(
+            status_code=400,
+            detail={
+                "error": "Violated guardrail policy",
+                "guardrail": "mcp_security",
+                "unregistered_servers": list(missing),
+                "unverified_servers": list(unverified),
+                "detection_message": message,
+            },
+        )
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "Could not check the request against the guardrail policy",
+            "guardrail": "mcp_security",
+            "unregistered_servers": [],
+            "unverified_servers": list(unverified),
+            "detection_message": f"{message} Try again.",
+        },
+    )
+
+
+class MCPSecurityGuardrail(CustomGuardrail):
+    def __init__(
+        self,
+        on_violation: Literal["block", "alert"] = "block",
+        **kwargs,
+    ):
+        kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
+        super().__init__(**kwargs)
+        self.on_violation = on_violation
+
+    @classmethod
+    def get_supported_event_hooks(cls) -> list[GuardrailEventHooks]:
+        return [GuardrailEventHooks.pre_call]
+
+    @log_guardrail_information
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        cache: "DualCache",
+        data: dict[str, object],
+        call_type: str,
+    ) -> Exception | str | dict[str, object] | None:
+        if self.should_run_guardrail(data=data, event_type=GuardrailEventHooks.pre_call) is not True:
+            return data
+
+        unregistered: Final = await self._find_unregistered_mcp_servers(data)
+        if not unregistered:
+            return data
+
+        missing: Final = _servers_whose_toolset_read(unregistered, failed=False)
+        unverified: Final = _servers_whose_toolset_read(unregistered, failed=True)
+        message: Final = _violation_message(missing, unverified)
+
+        if self.on_violation == "block":
+            raise _blocking_error(missing, unverified, message) from next(
+                (error for error in unregistered.values() if error is not None), None
+            )
+        verbose_proxy_logger.warning(message)
+        return data
+
+    @staticmethod
+    def _extract_mcp_server_names_from_tools(tools: Iterable[object]) -> set[str]:
+        """Extract MCP server names from tools with type=mcp and litellm_proxy server_url."""
+        server_names: Final[set[str]] = set()
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") != "mcp":
+                continue
+            server_url = tool.get("server_url", "")
+            if not isinstance(server_url, str):
+                continue
+            if server_url.startswith(LITELLM_PROXY_MCP_SERVER_URL_PREFIX):
+                name = server_url[len(LITELLM_PROXY_MCP_SERVER_URL_PREFIX) :]
+                if name:
+                    server_names.add(name)
+        return server_names
+
+    @staticmethod
+    async def _find_unregistered_mcp_servers(data: Mapping[str, object]) -> Mapping[str, Exception | None]:
+        """Maps each requested MCP server the gateway cannot vouch for to the toolset read error behind it, if any."""
+        tools: Final = data.get("tools")
+        if not tools or not isinstance(tools, list):
+            return MappingProxyType({})
+
+        requested_servers: Final = MCPSecurityGuardrail._extract_mcp_server_names_from_tools(tools)
+        if not requested_servers:
+            return MappingProxyType({})
+
+        from litellm.proxy.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        async with global_mcp_server_manager.catalog.operation():
+            not_servers: Final = frozenset(
+                name
+                for name in requested_servers
+                if global_mcp_server_manager.get_mcp_server_by_identifier(name) is None
+            )
+            lookups: Final = tuple([(name, await read_saved_toolset(name)) for name in not_servers])
+            return MappingProxyType(
+                {name: found if isinstance(found, Exception) else None for name, found in lookups if found is not True}
+            )

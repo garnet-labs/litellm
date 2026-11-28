@@ -1,0 +1,581 @@
+"""
+Utils used for litellm.transcription() and litellm.atranscription()
+"""
+
+import base64
+import binascii
+import hashlib
+import io
+import math
+import os
+import wave
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Final, Protocol
+
+from pydantic import ConfigDict, TypeAdapter, ValidationError
+
+from litellm.litellm_core_utils.core_helpers import has_attributes
+from litellm.types.files import (
+    AUDIO_FILE_TYPES,
+    FILE_EXTENSIONS,
+    FILE_MIME_TYPES,
+    FileType,
+    get_file_mime_type_from_extension,
+)
+from litellm.types.utils import FileTypes
+
+
+def normalized_audio_duration_seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds: Final = float(value)
+    except OverflowError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+LIBSNDFILE_UNKNOWN_FRAME_COUNT: Final = 2**63 - 1
+
+
+@dataclass
+class ProcessedAudioFile:
+    """
+    Processed audio file data.
+
+    Attributes:
+        file_content: The binary content of the audio file
+        filename: The filename (extracted or generated)
+        content_type: The MIME type of the audio file
+    """
+
+    file_content: bytes
+    filename: str
+    content_type: str
+
+
+def process_audio_file(audio_file: FileTypes) -> ProcessedAudioFile:
+    """
+    Common utility function to process audio files for audio transcription APIs.
+
+    Handles various input types:
+    - File paths (str, os.PathLike)
+    - Raw bytes/bytearray
+    - Tuples (filename, content, optional content_type)
+    - File-like objects with read() method
+
+    Args:
+        audio_file: The audio file input in various formats
+
+    Returns:
+        ProcessedAudioFile: Structured data with file content, filename, and content type
+
+    Raises:
+        ValueError: If audio_file type is unsupported or content cannot be extracted
+    """
+    file_content = None
+    filename = None
+
+    if isinstance(audio_file, (bytes, bytearray)):
+        # Raw bytes
+        filename = "audio.wav"
+        file_content = bytes(audio_file)
+    elif isinstance(audio_file, str):
+        # Bare strings are rejected — see extract_file_data for the same
+        # rationale: in a proxy request handler the string is
+        # attacker-controlled, and opening it as a path is an arbitrary
+        # file read.
+        raise ValueError(
+            "process_audio_file does not accept bare str inputs. Pass bytes, "
+            "an open file handle, a (filename, content) tuple, or a "
+            "pathlib.Path."
+        )
+    elif isinstance(audio_file, os.PathLike):
+        # File path or PathLike — PathLike is a Python-level type that
+        # HTTP form values can't fabricate.
+        file_path: Final = str(audio_file)
+        with open(file_path, "rb") as f:
+            file_content = f.read()
+        filename = file_path.split("/")[-1]
+    elif isinstance(audio_file, tuple):
+        # Tuple format: (filename, content, content_type) or (filename, content)
+        if len(audio_file) >= 2:
+            filename = audio_file[0] or "audio.wav"
+            content: Final = audio_file[1]
+            if isinstance(content, (bytes, bytearray)):
+                file_content = bytes(content)
+            elif isinstance(content, str):
+                raise ValueError(
+                    "process_audio_file does not accept bare str tuple "
+                    "contents. Pass bytes, an open file handle, or a "
+                    "pathlib.Path."
+                )
+            elif isinstance(content, os.PathLike):
+                # PathLike: SDK convenience for local-file uploads.
+                with open(str(content), "rb") as f:
+                    file_content = f.read()
+            elif hasattr(content, "read"):
+                # File-like object
+                file_content = content.read()
+                if hasattr(content, "seek"):
+                    content.seek(0)
+            else:
+                raise ValueError(f"Unsupported content type in tuple: {type(content)}")
+        else:
+            raise ValueError("Tuple must have at least 2 elements: (filename, content)")
+    elif hasattr(audio_file, "read") and not isinstance(audio_file, (str, bytes, bytearray, tuple, os.PathLike)):
+        # File-like object (IO) - check this after all other types
+        filename = getattr(audio_file, "name", "audio.wav")
+        file_content = audio_file.read()
+        # Reset file pointer if possible
+        if hasattr(audio_file, "seek"):
+            audio_file.seek(0)
+    else:
+        raise ValueError(f"Unsupported audio_file type: {type(audio_file)}")
+
+    if file_content is None:
+        raise ValueError("Could not extract file content from audio_file")
+
+    # Determine content type using LiteLLM's file type utilities
+    content_type = "audio/wav"  # Default fallback
+    if filename:
+        try:
+            # Extract extension from filename
+            extension: Final = filename.split(".")[-1].lower() if "." in filename else "wav"
+            content_type = get_file_mime_type_from_extension(extension)
+        except ValueError:
+            # If extension is not recognized, fallback to audio/wav
+            content_type = "audio/wav"
+
+    return ProcessedAudioFile(file_content=file_content, filename=filename, content_type=content_type)
+
+
+BARE_ISO_639_1_TO_BCP47: Final = {
+    "en": "en-US",
+    "es": "es-ES",
+    "de": "de-DE",
+    "fr": "fr-FR",
+    "it": "it-IT",
+    "pt": "pt-BR",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "zh": "zh-CN",
+    "ru": "ru-RU",
+    "hi": "hi-IN",
+    "ar": "ar-SA",
+}
+
+
+def normalize_transcription_language_to_bcp47(language: str) -> str:
+    """
+    OpenAI's transcription `language` param accepts bare ISO-639-1 codes like
+    ``en``; speech APIs such as Google Speech-to-Text and NVIDIA Riva require
+    BCP-47 like ``en-US``. Map the most common bare codes and pass through
+    anything already region-qualified (or unknown, for a clear provider error).
+    """
+    if "-" in language:
+        return language
+    return BARE_ISO_639_1_TO_BCP47.get(language.lower(), language)
+
+
+class _NamedFile(Protocol):
+    @property
+    def name(self) -> str: ...
+
+
+class _ReadableFile(Protocol):
+    def read(self) -> object: ...
+
+
+class _TellableFile(Protocol):
+    def tell(self) -> object: ...
+
+
+class _SeekableFile(Protocol):
+    def seek(self, offset: object, /) -> object: ...
+
+
+_FILE_TUPLE: Final = TypeAdapter(tuple[object, ...], config=ConfigDict(strict=True))
+
+
+def _file_tuple(file_obj: object) -> tuple[object, ...] | None:
+    try:
+        return _FILE_TUPLE.validate_python(file_obj)
+    except ValidationError:
+        return None
+
+
+def _is_path_like(value: object) -> bool:
+    return isinstance(value, os.PathLike)
+
+
+def get_audio_file_name(file_obj: object) -> str:
+    """
+    Safely get the name of a file-like object or return its string representation.
+
+    Args:
+        file_obj (Any): A file-like object or any other object.
+
+    Returns:
+        str: The name of the file if available, otherwise a string representation of the object.
+    """
+    if has_attributes(file_obj, _NamedFile, "name"):
+        return file_obj.name
+    elif hasattr(file_obj, "__str__"):
+        return str(file_obj)
+    else:
+        return repr(file_obj)
+
+
+def get_audio_file_content_hash(file_obj: object) -> str:
+    """
+    Compute SHA-256 hash of audio file content for cache keys.
+    Falls back to filename hash if content extraction fails.
+    """
+    file_content: object = None
+    fallback_filename: str | None = None
+
+    file_parts: Final = _file_tuple(file_obj)
+    if file_parts is not None:
+        if len(file_parts) < 2:
+            fallback_filename = str(file_parts[0]) if len(file_parts) > 0 else None
+            file_content_obj = None
+        else:
+            fallback_filename = str(file_parts[0]) if file_parts[0] is not None else None
+            file_content_obj = file_parts[1]
+    else:
+        file_content_obj = file_obj
+        fallback_filename = get_audio_file_name(file_obj)
+
+    try:
+        if isinstance(file_content_obj, (bytes, bytearray)):
+            file_content = bytes(file_content_obj)
+        elif isinstance(file_content_obj, str):
+            # Bare strings are not treated as file paths in this helper —
+            # the cache-key path is reached from request handlers where the
+            # value is attacker-controlled. Fall back to hashing the string
+            # itself rather than opening it.
+            fallback_filename = file_content_obj
+            file_content = None
+        elif _is_path_like(file_content_obj):
+            try:
+                with open(str(file_content_obj), "rb") as f:
+                    file_content = f.read()
+                if fallback_filename is None:
+                    fallback_filename = str(file_content_obj)
+            except OSError:
+                fallback_filename = str(file_content_obj)
+                file_content = None
+        elif file_content_obj is not None and has_attributes(file_content_obj, _ReadableFile, "read"):
+            try:
+                current_position: Final = (
+                    file_content_obj.tell() if has_attributes(file_content_obj, _TellableFile, "tell") else None
+                )
+                if has_attributes(file_content_obj, _SeekableFile, "seek"):
+                    file_content_obj.seek(0)
+                file_content = file_content_obj.read()
+                if current_position is not None and has_attributes(file_content_obj, _SeekableFile, "seek"):
+                    file_content_obj.seek(current_position)
+            except (OSError, AttributeError):
+                file_content = None
+        else:
+            file_content = None
+    except Exception:
+        file_content = None
+
+    if file_content is not None and isinstance(file_content, bytes):
+        try:
+            hash_object = hashlib.sha256(file_content)
+            return hash_object.hexdigest()
+        except Exception:
+            pass
+
+    if fallback_filename:
+        hash_object = hashlib.sha256(fallback_filename.encode("utf-8"))
+        return hash_object.hexdigest()
+
+    file_obj_str: Final = str(file_obj)
+    hash_object = hashlib.sha256(file_obj_str.encode("utf-8"))
+    return hash_object.hexdigest()
+
+
+def get_audio_file_for_health_check() -> FileTypes:
+    """
+    Get an audio file for health check
+
+    Returns the content of `audio_health_check.wav` in the same directory as this file
+    """
+    pwd: Final = os.path.dirname(os.path.realpath(__file__))
+    file_path: Final = os.path.join(pwd, "audio_health_check.wav")
+    return open(file_path, "rb")
+
+
+def calculate_request_duration(file: FileTypes) -> float | None:
+    """
+    Calculate audio duration from file content.
+
+    Args:
+        file: The audio file (can be file path, bytes, or file-like object)
+
+    Returns:
+        Duration in seconds, or None if extraction fails or soundfile is not available
+    """
+    try:
+        import soundfile as sf
+    except ImportError:
+        # soundfile not available, cannot extract duration
+        return None
+
+    try:
+        import io
+
+        # Handle different file input types
+        file_content: bytes | None = None
+
+        if isinstance(file, (bytes, bytearray)):
+            # Raw bytes
+            file_content = bytes(file)
+        elif isinstance(file, str):
+            # Bare strings are rejected — see extract_file_data.
+            raise ValueError(
+                "calculate_request_duration does not accept bare str inputs. "
+                "Pass bytes, an open file handle, a (filename, content) "
+                "tuple, or a pathlib.Path."
+            )
+        elif isinstance(file, os.PathLike) or (
+            isinstance(file, tuple) and len(file) >= 2 and isinstance(file[1], os.PathLike)
+        ):
+            # File path (PathLike), bare or as the content of a (filename, path) tuple: SDK convenience.
+            path: Final = file if isinstance(file, os.PathLike) else file[1]
+            with open(str(path), "rb") as f:
+                file_content = f.read()
+        elif isinstance(file, tuple):
+            # Tuple format: (filename, content, optional content_type)
+            if len(file) >= 2:
+                content: Final = file[1]
+                if isinstance(content, bytes):
+                    file_content = content
+                elif hasattr(content, "read") and not isinstance(content, (str, os.PathLike)):
+                    # File-like object in tuple
+                    current_pos: Final = content.tell() if hasattr(content, "tell") else None
+                    # Seek to start to ensure we read the entire content
+                    if hasattr(content, "seek"):
+                        content.seek(0)
+                    file_content = content.read()
+                    if current_pos is not None and hasattr(content, "seek"):
+                        content.seek(current_pos)
+        elif hasattr(file, "read") and not isinstance(file, tuple):
+            # File-like object (including BytesIO)
+            current_position: Final = file.tell() if hasattr(file, "tell") else None
+            # Seek to start to ensure we read the entire content
+            if hasattr(file, "seek"):
+                file.seek(0)
+            file_content = file.read()
+            # Reset file position if possible
+            if current_position is not None and hasattr(file, "seek"):
+                file.seek(current_position)
+
+        if file_content is None or not isinstance(file_content, bytes):
+            return None
+
+        # Extract duration using soundfile
+        file_object: Final = io.BytesIO(file_content)
+        with sf.SoundFile(file_object) as audio:
+            frames: Final = len(audio)
+            if frames >= LIBSNDFILE_UNKNOWN_FRAME_COUNT:
+                return None
+            duration: Final = frames / audio.samplerate
+            return duration
+
+    except Exception:
+        # Silently fail if duration extraction fails
+        return None
+
+
+DEFAULT_AUDIO_TOKEN_ESTIMATE: Final = 300
+AUDIO_TOKENS_PER_SECOND: Final = 10
+AUDIO_BYTES_PER_TOKEN: Final = 1600
+_MAX_AUDIO_ESTIMATE_BYTES: Final = 16 * 1024 * 1024
+
+
+def _audio_token_rate(model: str) -> int | None:
+    if model.startswith(
+        ("gemini-", "gemini/gemini-", "vertex_ai/gemini-", "vertex_ai_beta/gemini-", "openrouter/google/gemini-")
+    ):
+        family: Final = model.rsplit("/", 1)[-1]
+        return 25 if family.startswith(("gemini-3-", "gemini-3.")) else 32
+    if model.startswith(("gpt-", "openai/gpt-", "azure/gpt-", "openrouter/openai/gpt-")):
+        return AUDIO_TOKENS_PER_SECOND
+    return None
+
+
+def estimate_audio_tokens(data: str | None, models: Sequence[str] = (), fallback_model: str | None = None) -> int:
+    """Estimate audio tokens from container duration within a bounded decoding budget."""
+    if not data:
+        return DEFAULT_AUDIO_TOKEN_ESTIMATE
+    duration_tokens: Final = audio_duration_tokens(data, models, fallback_model)
+    if duration_tokens is None:
+        return max(len(data) * 3 // 4 // AUDIO_BYTES_PER_TOKEN, DEFAULT_AUDIO_TOKEN_ESTIMATE)
+    return duration_tokens
+
+
+def audio_duration_tokens(data: str, models: Sequence[str], fallback_model: str | None) -> int | None:
+    padding: Final = 2 if data.endswith("==") else 1 if data.endswith("=") else 0
+    if len(data) * 3 // 4 - padding > _MAX_AUDIO_ESTIMATE_BYTES:
+        return None
+    try:
+        duration: Final = calculate_request_duration(base64.b64decode(data, validate=True))
+    except (ValueError, binascii.Error):
+        return None
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        return None
+    fallback_rate: Final = _audio_token_rate(fallback_model) if fallback_model is not None else None
+    rate: Final = max(
+        (_audio_token_rate(model) or fallback_rate or AUDIO_TOKENS_PER_SECOND for model in models),
+        default=fallback_rate or AUDIO_TOKENS_PER_SECOND,
+    )
+    return max(1, math.ceil(duration * rate))
+
+
+DEFAULT_SPEECH_MEDIA_TYPE: Final = "audio/mpeg"
+
+
+def _speech_media_type_for_response_format(response_format: str) -> str | None:
+    file_type: Final = next(
+        (candidate for candidate, extensions in FILE_EXTENSIONS.items() if response_format.lower() in extensions),
+        None,
+    )
+    if file_type is None or file_type not in AUDIO_FILE_TYPES:
+        return None
+    return FILE_MIME_TYPES[file_type]
+
+
+def resolve_speech_media_type(upstream_content_type: str | None, response_format: str | None) -> str:
+    upstream_media_type: Final = (upstream_content_type or "").split(";", 1)[0].strip().lower()
+    if upstream_media_type.startswith("audio/"):
+        return upstream_media_type
+    requested_media_type: Final = (
+        None if response_format is None else _speech_media_type_for_response_format(response_format)
+    )
+    return requested_media_type or DEFAULT_SPEECH_MEDIA_TYPE
+
+
+_OGG_OPUS_HEAD_WINDOW: Final = 64
+_ADTS_SYNC_AND_LAYER_MASK: Final = 0xF6
+_ADTS_SYNC_AND_LAYER: Final = 0xF0
+_ADTS_SAMPLE_RATE_INDEX_LIMIT: Final = 13
+_MPEG_SYNC_MASK: Final = 0xE0
+_MPEG_LAYER_MASK: Final = 0x06
+_MPEG_RESERVED_VERSION: Final = 0x01
+_MPEG_INVALID_BITRATE_INDEX: Final = 0x0F
+_MPEG_RESERVED_SAMPLE_RATE_INDEX: Final = 0x03
+
+
+def _adts_aac_frame_media_type(header: bytes) -> str | None:
+    sample_rate_index: Final = (header[2] >> 2) & 0x0F
+    return FILE_MIME_TYPES[FileType.AAC] if sample_rate_index < _ADTS_SAMPLE_RATE_INDEX_LIMIT else None
+
+
+def _mpeg_audio_frame_media_type(header: bytes) -> str | None:
+    version: Final = (header[1] >> 3) & 0x03
+    layer: Final = header[1] & _MPEG_LAYER_MASK
+    bitrate_index: Final = header[2] >> 4
+    sample_rate_index: Final = (header[2] >> 2) & 0x03
+    if (
+        (header[1] & _MPEG_SYNC_MASK) != _MPEG_SYNC_MASK
+        or version == _MPEG_RESERVED_VERSION
+        or layer == 0
+        or bitrate_index == _MPEG_INVALID_BITRATE_INDEX
+        or sample_rate_index == _MPEG_RESERVED_SAMPLE_RATE_INDEX
+    ):
+        return None
+    return FILE_MIME_TYPES[FileType.MP3]
+
+
+def speech_media_type_from_audio_bytes(audio: bytes) -> str | None:
+    if audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
+        return FILE_MIME_TYPES[FileType.WAV]
+    if audio[:4] == b"fLaC":
+        return FILE_MIME_TYPES[FileType.FLAC]
+    if audio[:4] == b"OggS":
+        is_opus: Final = b"OpusHead" in audio[:_OGG_OPUS_HEAD_WINDOW]
+        return FILE_MIME_TYPES[FileType.OPUS if is_opus else FileType.OGG]
+    if audio[:3] == b"ID3":
+        return FILE_MIME_TYPES[FileType.MP3]
+    if len(audio) < 3 or audio[0] != 0xFF:
+        return None
+    if (audio[1] & _ADTS_SYNC_AND_LAYER_MASK) == _ADTS_SYNC_AND_LAYER:
+        return _adts_aac_frame_media_type(audio)
+    return _mpeg_audio_frame_media_type(audio)
+
+
+_PCM16_WAV_SHAPE: Final = (1, 2, 24000)
+_WAV_MEDIA_TYPES: Final = frozenset({FILE_MIME_TYPES[FileType.WAV], "audio/x-wav", "audio/wave", "audio/vnd.wave"})
+_WAV_HEADER_BASE64_CHARS: Final = 4096
+
+
+def _strict_b64decode(data: str) -> bytes | None:
+    try:
+        return base64.b64decode(data, validate=True)
+    except ValueError:
+        return None
+
+
+def _wav_shape(audio: bytes) -> tuple[int, int, int] | None:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            return (wav.getnchannels(), wav.getsampwidth(), wav.getframerate())
+    except (wave.Error, EOFError, RuntimeError):
+        return None
+
+
+def _pcm16_wav_frames(audio: bytes) -> bytes | None:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            shape: Final = (wav.getnchannels(), wav.getsampwidth(), wav.getframerate())
+            return wav.readframes(wav.getnframes()) if shape == _PCM16_WAV_SHAPE else None
+    except (wave.Error, EOFError, RuntimeError):
+        return None
+
+
+def as_raw_pcm16_base64(media_type: str, audio_base64: str) -> str:
+    if media_type.partition(";")[0].strip().lower() not in _WAV_MEDIA_TYPES:
+        return audio_base64
+    header: Final = _strict_b64decode(audio_base64[:_WAV_HEADER_BASE64_CHARS])
+    if header is None or _wav_shape(header) not in (None, _PCM16_WAV_SHAPE):
+        return audio_base64
+    audio: Final = _strict_b64decode(audio_base64)
+    frames: Final = _pcm16_wav_frames(audio) if audio is not None else None
+    return base64.b64encode(frames).decode("ascii") if frames else audio_base64
+
+
+_RAW_PCM16_MEDIA_TYPES: Final = frozenset({"audio/l16", "audio/pcm"})
+
+
+def _media_type_count(media_type: str, name: str, default: int) -> int:
+    value: Final = next(
+        (
+            value.strip()
+            for key, _, value in (item.partition("=") for item in media_type.split(";")[1:])
+            if key.strip().lower() == name
+        ),
+        "",
+    )
+    return int(value) if value.isascii() and value.isdecimal() and int(value) > 0 else default
+
+
+def as_wav_base64(media_type: str, audio_base64: str) -> str:
+    if media_type.partition(";")[0].strip().lower() not in _RAW_PCM16_MEDIA_TYPES:
+        return audio_base64
+    frames: Final = _strict_b64decode(audio_base64)
+    if frames is None:
+        return audio_base64
+    channels, sample_width, default_rate = _PCM16_WAV_SHAPE
+    buffer: Final = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(_media_type_count(media_type, "channels", channels))
+        wav.setsampwidth(sample_width)
+        wav.setframerate(_media_type_count(media_type, "rate", default_rate))
+        wav.writeframes(frames)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")

@@ -1,0 +1,345 @@
+from abc import abstractmethod
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Final, cast
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+from typing_extensions import TypedDict
+
+import litellm
+from litellm.constants import STREAM_SSE_DONE_STRING, VLLM_STREAM_PROMPT_FIELDS
+from litellm.litellm_core_utils.core_helpers import attribute_or_none, loads_json_object
+from litellm.litellm_core_utils.hidden_params import set_extra_attribute, stored_attribute
+from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.custom_httpx.sse_lines import is_sse_payload_line
+
+if TYPE_CHECKING:
+    import httpx
+from litellm.types.llms.openai import ChatCompletionRedactedThinkingBlock, ChatCompletionThinkingBlock
+from litellm.types.utils import (
+    Choices,
+    Delta,
+    GenericStreamingChunk,
+    Message,
+    ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
+)
+
+
+def _indexed_thinking_block(
+    block: ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock, index: int
+) -> ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock:
+    if block["type"] == "redacted_thinking":
+        return {**block, "index": index}
+    return {**block, "index": index}
+
+
+class _DeltaFields(TypedDict, total=False, extra_items=object):
+    pass
+
+
+def _message_fields_without_thinking_blocks(message: Message) -> Mapping[str, object]:
+    return message.model_dump(exclude={"thinking_blocks"})
+
+
+def _streaming_delta(message: Message) -> Delta:
+    thinking_blocks: Final = message.thinking_blocks if hasattr(message, "thinking_blocks") else None
+    return Delta(
+        **_DeltaFields(**_message_fields_without_thinking_blocks(message)),
+        thinking_blocks=(
+            None
+            if thinking_blocks is None
+            else [_indexed_thinking_block(block, index) for index, block in enumerate(thinking_blocks)]
+        ),
+    )
+
+
+def convert_model_response_to_streaming(
+    model_response: ModelResponse,
+) -> ModelResponseStream:
+    """
+    Convert a ModelResponse to ModelResponseStream.
+
+    This function transforms a standard completion response into a streaming chunk format
+    by converting 'message' fields to 'delta' fields.
+
+    Args:
+        model_response: The ModelResponse to convert
+
+    Returns:
+        ModelResponseStream: A streaming chunk version of the response
+
+    Raises:
+        ValueError: If the conversion fails
+    """
+    try:
+        streaming_choices: Final[list[StreamingChoices]] = []
+        for choice in model_response.choices:
+            streaming_choices.append(
+                StreamingChoices(
+                    index=choice.index,
+                    delta=_streaming_delta(cast(Choices, choice).message),
+                    finish_reason=choice.finish_reason,
+                    logprobs=stored_attribute(choice, "logprobs"),
+                )
+            )
+        processed_chunk: Final = ModelResponseStream(
+            id=model_response.id,
+            object="chat.completion.chunk",
+            created=model_response.created,
+            model=model_response.model,
+            system_fingerprint=model_response.system_fingerprint,
+            choices=streaming_choices,
+        ).model_copy(
+            update={
+                field: value
+                for field in VLLM_STREAM_PROMPT_FIELDS
+                if (value := attribute_or_none(model_response, field)) is not None
+            }
+        )
+        service_tier: Final = stored_attribute(model_response, "service_tier")
+        if service_tier is not None:
+            set_extra_attribute(processed_chunk, "service_tier", service_tier)
+        # Carry usage onto the streaming chunk so fake-streamed responses
+        # (e.g. Vertex AI Gemma :predict) still report token counts.
+        usage: Final = getattr(model_response, "usage", None)
+        if usage is not None:
+            setattr(processed_chunk, "usage", usage)
+        return processed_chunk
+    except Exception as e:
+        raise ValueError(f"Failed to convert ModelResponse to ModelResponseStream: {model_response}. Error: {e}")
+
+
+UPSTREAM_ABORT_MESSAGE: Final = "Upstream generation aborted (finish_reason=abort)"
+
+
+class _StreamedChoice(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    finish_reason: object = None
+
+
+class _StreamedChunk(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    choices: tuple[_StreamedChoice, ...] | None = None
+
+
+class UpstreamAbortError(BaseLLMException):
+    pass
+
+
+def upstream_abort_error() -> UpstreamAbortError:
+    return UpstreamAbortError(status_code=500, message=UPSTREAM_ABORT_MESSAGE)
+
+
+def raise_on_upstream_abort(chunk: object) -> None:
+    try:
+        choices: Final = _StreamedChunk.model_validate(chunk).choices or ()
+    except ValidationError:
+        return
+    if any(choice.finish_reason == "abort" for choice in choices):
+        raise upstream_abort_error()
+
+
+class BaseModelResponseIterator:
+    def __init__(self, streaming_response, sync_stream: bool, json_mode: bool | None = False):
+        self.streaming_response = streaming_response
+        self.response_iterator = self.streaming_response
+        self.json_mode = json_mode
+        self.http_response: httpx.Response | None = None
+
+    async def aclose(self) -> None:
+        """Close the upstream HTTP response so the provider connection is
+        released (and a backend like vLLM aborts generation) when the stream
+        is abandoned before its natural end.
+
+        ``streaming_response`` is usually a bare ``aiter_sse_lines()`` generator
+        that holds no reference to the response, so the handler that owns the
+        response attaches it here after construction."""
+        if self.http_response is not None:
+            await self.http_response.aclose()
+
+    def close(self) -> None:
+        if self.http_response is not None:
+            self.http_response.close()
+
+    def chunk_parser(self, chunk: dict[str, object]) -> GenericStreamingChunk | ModelResponseStream:
+        return GenericStreamingChunk(
+            text="",
+            is_finished=False,
+            finish_reason="",
+            usage=None,
+            index=0,
+            tool_use=None,
+        )
+
+    # Sync iterator
+    def __iter__(self):
+        return self
+
+    @staticmethod
+    def _string_to_dict_parser(str_line: str) -> dict[str, object] | None:
+        stripped_chunk: Final = litellm.CustomStreamWrapper.strip_sse_data_from_chunk(str_line)
+        decoded: Final = None if stripped_chunk is None else loads_json_object(stripped_chunk)
+        return decoded if isinstance(decoded, dict) else None
+
+    @classmethod
+    def string_to_dict_parser(
+        cls,
+        str_line: str,
+    ) -> dict[str, object] | None:  # mutable-ok: mirrors override contract
+        return cls._string_to_dict_parser(str_line)
+
+    def _handle_string_chunk(self, str_line: str) -> GenericStreamingChunk | ModelResponseStream:
+        # chunk is a str at this point
+        stripped_json_chunk: Final = BaseModelResponseIterator.string_to_dict_parser(str_line=str_line)
+        stripped_sse_chunk: Final = litellm.CustomStreamWrapper.strip_sse_data_from_chunk(str_line)
+        if stripped_sse_chunk is not None and stripped_sse_chunk.strip() == STREAM_SSE_DONE_STRING:
+            return GenericStreamingChunk(
+                text="",
+                is_finished=True,
+                finish_reason="stop",
+                usage=None,
+                index=0,
+                tool_use=None,
+            )
+        elif stripped_json_chunk:
+            parsed_chunk: Final = self.chunk_parser(chunk=stripped_json_chunk)
+            if '"abort"' in str_line:
+                raise_on_upstream_abort(stripped_json_chunk)
+            return parsed_chunk
+        else:
+            return GenericStreamingChunk(
+                text="",
+                is_finished=False,
+                finish_reason="",
+                usage=None,
+                index=0,
+                tool_use=None,
+            )
+
+    def __next__(self):
+        while True:
+            try:
+                chunk = self.response_iterator.__next__()
+            except StopIteration:
+                raise StopIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error receiving chunk from stream: {e}")
+
+            try:
+                str_line = chunk
+                if isinstance(chunk, bytes):  # Handle binary data
+                    str_line = chunk.decode("utf-8")  # Convert bytes to string
+                    index = str_line.find("data:")
+                    if index != -1:
+                        str_line = str_line[index:]
+
+                # Only apply to str chunks — non-string objects (e.g. Pydantic
+                # BaseModel events from the Responses API) must pass through.
+                if isinstance(str_line, str) and not is_sse_payload_line(str_line):
+                    continue
+
+                # chunk is a str at this point
+                return self._handle_string_chunk(str_line=str_line)
+            except StopIteration:
+                raise StopIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+
+    # Async iterator
+    def __aiter__(self):
+        self.async_response_iterator = self.streaming_response.__aiter__()
+        return self
+
+    async def __anext__(self):
+        while True:
+            try:
+                chunk = await self.async_response_iterator.__anext__()
+
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error receiving chunk from stream: {e}")
+
+            try:
+                str_line = chunk
+                if isinstance(chunk, bytes):  # Handle binary data
+                    str_line = chunk.decode("utf-8")  # Convert bytes to string
+                    index = str_line.find("data:")
+                    if index != -1:
+                        str_line = str_line[index:]
+
+                # Only apply to str chunks — non-string objects (e.g. Pydantic
+                # BaseModel events from the Responses API) must pass through.
+                if isinstance(str_line, str) and not is_sse_payload_line(str_line):
+                    continue
+
+                # chunk is a str at this point
+                chunk = self._handle_string_chunk(str_line=str_line)
+
+                return chunk
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+            except ValueError as e:
+                raise RuntimeError(f"Error parsing chunk: {e},\nReceived chunk: {chunk}")
+
+
+class MockResponseIterator:  # for returning ai21 streaming responses
+    def __init__(self, model_response: ModelResponse, json_mode: bool | None = False):
+        self.model_response = model_response
+        self.json_mode = json_mode
+        self.is_done = False
+
+    # Sync iterator
+    def __iter__(self):
+        return self
+
+    def _chunk_parser(self, chunk_data: ModelResponse) -> ModelResponseStream:
+        return convert_model_response_to_streaming(chunk_data)
+
+    def __next__(self):
+        if self.is_done:
+            raise StopIteration
+        self.is_done = True
+        return self._chunk_parser(self.model_response)
+
+    # Async iterator
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.is_done:
+            raise StopAsyncIteration
+        self.is_done = True
+        return self._chunk_parser(self.model_response)
+
+
+class FakeStreamResponseIterator:
+    def __init__(self, model_response, json_mode: bool | None = False):
+        self.model_response = model_response
+        self.json_mode = json_mode
+        self.is_done = False
+
+    # Sync iterator
+    def __iter__(self):
+        return self
+
+    @abstractmethod
+    def chunk_parser(self, chunk: dict[str, object]) -> GenericStreamingChunk:
+        pass
+
+    def __next__(self):
+        if self.is_done:
+            raise StopIteration
+        self.is_done = True
+        return self.chunk_parser(self.model_response)
+
+    # Async iterator
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.is_done:
+            raise StopAsyncIteration
+        self.is_done = True
+        return self.chunk_parser(self.model_response)
